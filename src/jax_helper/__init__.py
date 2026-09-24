@@ -1,6 +1,6 @@
 """vmappable and jittable scalar root-finding routines for JAX."""
 
-from .multi_root import MultiRootResult, find_roots, find_roots_scan, find_roots_tree
+from .multi_root import MultiRootResult, roots_chebyshev, roots_scan, roots_chebyshev_recursive
 from .root_finding import RootResult, bisection, brent, newton, secant, steffensen
 
 __all__ = [
@@ -8,9 +8,9 @@ __all__ = [
     "RootResult",
     "bisection",
     "brent",
-    "find_roots",
-    "find_roots_scan",
-    "find_roots_tree",
+    "roots_chebyshev",
+    "roots_scan",
+    "roots_chebyshev_recursive",
     "newton",
     "secant",
     "steffensen",

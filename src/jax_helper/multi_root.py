@@ -30,7 +30,8 @@ from .root_finding import bisection, brent, newton, steffensen
 
 
 class MultiRootResult(eqx.Module):
-    """Result of :func:`find_roots`.
+    """Result of the multi-root routines (:func:`roots_chebyshev`,
+    :func:`roots_chebyshev_recursive`, :func:`roots_scan`).
 
     An Equinox module (and JAX pytree) holding the array of real roots found,
     the function values there, a validity mask and the total root count.
@@ -241,7 +242,7 @@ def _polish(x: Any, f: Callable[..., Any], args: Tuple[Any, ...],
         raise ValueError(f"unknown polish method: {method!r}")
 
 
-def find_roots(
+def roots_chebyshev(
     f: Callable[..., Any],
     a: Any,
     b: Any,
@@ -302,7 +303,7 @@ def find_roots(
     NaN-padded to a fixed width ``n_max`` with no validation against an
     expected count; use ``count`` to read the number of real roots found.  The
     routine is jittable and vmappable over ``args``; when JIT-ing, close over
-    ``f``, e.g. ``jax.jit(lambda a, b: find_roots(f, a, b))``.
+    ``f``, e.g. ``jax.jit(lambda a, b: roots_chebyshev(f, a, b))``.
 
     The routine is dtype-agnostic: it follows ``jax_enable_x64`` (and any
     explicit dtype of the inputs), with ``prox_tol`` interpreted relative to
@@ -310,8 +311,8 @@ def find_roots(
 
     See Also
     --------
-    find_roots_tree : Subdivision-based method.
-    find_roots_scan : Sign-change scan.
+    roots_chebyshev_recursive : Subdivision-based method.
+    roots_scan : Sign-change scan.
     bisection, brent, newton, secant, steffensen : Single-root methods.
     """
     c, _ = _grow(f, a, b, args, n0, n_max, prox_tol)
@@ -334,7 +335,7 @@ def find_roots(
     return lax.cond(m >= 1, solve, empty, operand=None)
 
 
-def find_roots_tree(
+def roots_chebyshev_recursive(
     f: Callable[..., Any],
     a: Any,
     b: Any,
@@ -404,13 +405,13 @@ def find_roots_tree(
     -----
     Because JAX requires static shapes, the worklist is a fixed-size array of
     ``max_nodes`` intervals; every interval is fitted (vectorised) at each
-    iteration, so for very simple functions :func:`find_roots` (degree
+    iteration, so for very simple functions :func:`roots_chebyshev` (degree
     doubling) may use fewer evaluations.  The subdivision uses
     :func:`jax.lax.while_loop`, so it stops once every interval is happy; it is
     jittable and vmappable over ``args``, but not reverse-mode differentiable.
 
     The colleague-matrix eigenvalue extraction has the same close-root
-    resolution limit as :func:`find_roots`: with the default ``n=8``, real
+    resolution limit as :func:`roots_chebyshev`: with the default ``n=8``, real
     roots closer than roughly ``1e-7`` (in float64) may be unresolved or merged;
     use a larger ``n`` if you need finer separation.
 
@@ -420,8 +421,8 @@ def find_roots_tree(
 
     See Also
     --------
-    find_roots : Single global-proxy method (degree doubling).
-    find_roots_scan : Sign-change scan.
+    roots_chebyshev : Single global-proxy method (degree doubling).
+    roots_scan : Sign-change scan.
     bisection, brent, newton, secant, steffensen : Single-root methods.
     """
     n_even = (n % 2 == 0)
@@ -561,7 +562,7 @@ def find_roots_tree(
     return MultiRootResult(roots, values, valid, valid.sum().astype(jnp.int32))
 
 
-def find_roots_scan(
+def roots_scan(
     f: Callable[..., Any],
     a: Any,
     b: Any,
@@ -617,7 +618,7 @@ def find_roots_scan(
 
     See Also
     --------
-    find_roots, find_roots_tree : Higher-resolution (proxy-based) methods.
+    roots_chebyshev, roots_chebyshev_recursive : Higher-resolution (proxy-based) methods.
     bisection, brent : The bracketed solvers used for refinement.
     """
     if method not in ("brent", "bisection"):

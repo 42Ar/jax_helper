@@ -7,15 +7,15 @@ from jax_helper import (
     MultiRootResult,
     bisection,
     brent,
-    find_roots,
-    find_roots_scan,
-    find_roots_tree,
+    roots_chebyshev,
+    roots_scan,
+    roots_chebyshev_recursive,
 )
 from jax_helper.multi_root import _grow
 
 jax.config.update("jax_enable_x64", True)
 
-METHODS = [find_roots, find_roots_tree]
+METHODS = [roots_chebyshev, roots_chebyshev_recursive]
 
 
 # --------------------------------------------------------------------------- #
@@ -104,14 +104,14 @@ def test_vmap_over_params(method):
 
 
 # --------------------------------------------------------------------------- #
-# find_roots-specific (single global proxy)
+# roots_chebyshev-specific (single global proxy)
 # --------------------------------------------------------------------------- #
 
 def test_close_pair_1e_8():
     # The global proxy (degree up to n_max) resolves a 1e-8 pair; the tree's
     # fixed degree (n=8) is at the precision limit there, so this is tested on
-    # find_roots only.
-    res = find_roots(lambda x: (x - 1) * (x - 1 - 1e-8) * (x - 2), -1.0, 4.0)
+    # roots_chebyshev only.
+    res = roots_chebyshev(lambda x: (x - 1) * (x - 1 - 1e-8) * (x - 2), -1.0, 4.0)
     assert int(res.count) == 3
     np.testing.assert_allclose(
         np.asarray(res.roots[:3]), [1.0, 1.0 + 1e-8, 2.0], atol=1e-11
@@ -119,7 +119,7 @@ def test_close_pair_1e_8():
 
 
 def test_steffensen_polish_derivative_free():
-    res = find_roots(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0,
+    res = roots_chebyshev(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0,
                      polish="steffensen")
     assert int(res.count) == 3
     np.testing.assert_allclose(np.asarray(res.roots[:3]), [1.0, 2.0, 3.0], atol=1e-6)
@@ -127,7 +127,7 @@ def test_steffensen_polish_derivative_free():
 
 def test_unknown_polish_raises():
     with pytest.raises(ValueError):
-        find_roots(lambda x: x - 1.0, -1.0, 4.0, polish="bogus")
+        roots_chebyshev(lambda x: x - 1.0, -1.0, 4.0, polish="bogus")
 
 
 def test_early_stop_at_degree_eight():
@@ -157,12 +157,12 @@ def test_reuse_never_re_evaluates_a_node():
 
 
 # --------------------------------------------------------------------------- #
-# find_roots_tree-specific (subdivision)
+# roots_chebyshev_recursive-specific (subdivision)
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("n", [7, 8, 16])
 def test_tree_supports_even_and_odd_degree(n):
-    res = find_roots_tree(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0, n=n)
+    res = roots_chebyshev_recursive(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0, n=n)
     assert int(res.count) == 3
     np.testing.assert_allclose(np.asarray(res.roots[:3]), [1.0, 2.0, 3.0], atol=1e-8)
 
@@ -170,26 +170,26 @@ def test_tree_supports_even_and_odd_degree(n):
 def test_tree_subdivides_oscillatory_function():
     # sin(20x) on [-1,1] has 13 zeros; the fixed degree must be high enough to
     # resolve each subinterval (n=8 is too coarse here).
-    res = find_roots_tree(lambda x: jnp.sin(20.0 * x), -1.0, 1.0, n=16)
+    res = roots_chebyshev_recursive(lambda x: jnp.sin(20.0 * x), -1.0, 1.0, n=16)
     assert int(res.count) == 13
     expected = jnp.array([k * jnp.pi / 20.0 for k in range(-6, 7)])
     np.testing.assert_allclose(np.asarray(res.roots[:13]), expected, atol=1e-8)
 
 
 def test_tree_steffensen_polish():
-    res = find_roots_tree(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0,
+    res = roots_chebyshev_recursive(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0,
                           polish="steffensen")
     assert int(res.count) == 3
     np.testing.assert_allclose(np.asarray(res.roots[:3]), [1.0, 2.0, 3.0], atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #
-# find_roots_scan (sign-change scan)
+# roots_scan (sign-change scan)
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("method", ["brent", "bisection"])
 def test_scan_cubic(method):
-    res = find_roots_scan(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0,
+    res = roots_scan(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0,
                           xtol=1e-10, method=method)
     assert int(res.count) == 3
     np.testing.assert_allclose(np.asarray(res.roots[:3]), [1.0, 2.0, 3.0], atol=1e-8)
@@ -197,27 +197,27 @@ def test_scan_cubic(method):
 
 @pytest.mark.parametrize("method", ["brent", "bisection"])
 def test_scan_transcendental(method):
-    res = find_roots_scan(lambda x: jnp.cos(x) - x, -1.0, 1.5, xtol=1e-10, method=method)
+    res = roots_scan(lambda x: jnp.cos(x) - x, -1.0, 1.5, xtol=1e-10, method=method)
     assert int(res.count) == 1
     np.testing.assert_allclose(res.roots[0], 0.7390851332151607, atol=1e-8)
 
 
 def test_scan_single_and_no_root():
-    assert int(find_roots_scan(lambda x: x - 1.0, -1.0, 4.0, xtol=1e-10).count) == 1
-    assert int(find_roots_scan(lambda x: x**2 + 1.0, -1.0, 4.0, xtol=1e-10).count) == 0
+    assert int(roots_scan(lambda x: x - 1.0, -1.0, 4.0, xtol=1e-10).count) == 1
+    assert int(roots_scan(lambda x: x**2 + 1.0, -1.0, 4.0, xtol=1e-10).count) == 0
 
 
 def test_scan_respects_boundaries():
     # Roots exactly at the interval endpoints a=0 and b=1.
-    res = find_roots_scan(lambda x: x * (x - 1.0), 0.0, 1.0, xtol=1e-10)
+    res = roots_scan(lambda x: x * (x - 1.0), 0.0, 1.0, xtol=1e-10)
     assert int(res.count) == 2
     np.testing.assert_allclose(np.asarray(res.roots[:2]), [0.0, 1.0], atol=1e-10)
 
 
 def test_scan_jit():
     f = lambda x: (x - 1) * (x - 2) * (x - 3)
-    eager = find_roots_scan(f, -1.0, 4.0, xtol=1e-10)
-    compiled = jax.jit(lambda a, b: find_roots_scan(f, a, b, xtol=1e-10))(-1.0, 4.0)
+    eager = roots_scan(f, -1.0, 4.0, xtol=1e-10)
+    compiled = jax.jit(lambda a, b: roots_scan(f, a, b, xtol=1e-10))(-1.0, 4.0)
     np.testing.assert_allclose(
         np.asarray(compiled.roots), np.asarray(eager.roots), equal_nan=True
     )
@@ -226,7 +226,7 @@ def test_scan_jit():
 def test_scan_vmap():
     g = lambda x, c: x**2 - c
     cs = jnp.array([1.0, 4.0, 9.0])
-    res = jax.vmap(lambda c: find_roots_scan(g, -5.0, 5.0, args=(c,), xtol=1e-10))(cs)
+    res = jax.vmap(lambda c: roots_scan(g, -5.0, 5.0, args=(c,), xtol=1e-10))(cs)
     assert np.all(np.asarray(res.count) == 2)
     for i, c in enumerate([1.0, 4.0, 9.0]):
         np.testing.assert_allclose(
@@ -237,14 +237,14 @@ def test_scan_vmap():
 def test_scan_misses_even_multiplicity():
     # A double root (no sign change) at a non-grid point is missed; only the
     # simple root at x=2 is found.
-    res = find_roots_scan(lambda x: (x - 0.501) ** 2 * (x - 2.0), -1.0, 4.0, xtol=1e-10)
+    res = roots_scan(lambda x: (x - 0.501) ** 2 * (x - 2.0), -1.0, 4.0, xtol=1e-10)
     assert int(res.count) == 1
     np.testing.assert_allclose(res.roots[0], 2.0, atol=1e-8)
 
 
 def test_scan_unknown_method_raises():
     with pytest.raises(ValueError):
-        find_roots_scan(lambda x: x - 1.0, -1.0, 4.0, method="newton")
+        roots_scan(lambda x: x - 1.0, -1.0, 4.0, method="newton")
 
 
 def test_bisection_accepts_precomputed_values():
@@ -261,12 +261,12 @@ def test_brent_accepts_precomputed_values():
     np.testing.assert_allclose(res.root, 2.0 ** (1.0 / 3.0), atol=1e-8)
 
 
-def test_find_roots_atol_x_tolerance():
+def test_roots_chebyshev_atol_x_tolerance():
     # A coarse proxy (prox_tol=1e-3) is refined to x-accuracy by xtol.
-    res = find_roots(lambda x: jnp.cos(x) - x, -1.0, 1.5, prox_tol=1e-3, xtol=1e-10)
+    res = roots_chebyshev(lambda x: jnp.cos(x) - x, -1.0, 1.5, prox_tol=1e-3, xtol=1e-10)
     np.testing.assert_allclose(res.roots[0], 0.7390851332151607, atol=1e-9)
 
 
-def test_find_roots_tree_atol_x_tolerance():
-    res = find_roots_tree(lambda x: jnp.cos(x) - x, -1.0, 1.5, prox_tol=1e-3, xtol=1e-10)
+def test_roots_chebyshev_recursive_atol_x_tolerance():
+    res = roots_chebyshev_recursive(lambda x: jnp.cos(x) - x, -1.0, 1.5, prox_tol=1e-3, xtol=1e-10)
     np.testing.assert_allclose(res.roots[0], 0.7390851332151607, atol=1e-9)
