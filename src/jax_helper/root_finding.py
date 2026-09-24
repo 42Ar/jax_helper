@@ -1,11 +1,12 @@
 """Scalar root-finding routines for JAX.
 
 Every routine here is written so that it composes cleanly with ``jax.jit``,
-``jax.vmap``, and ``jax.grad``:
+``jax.vmap``, and ``jax.jvp``:
 
-* Iteration is done with :func:`jax.lax.fori_loop` using a static ``maxiter``.
-  Unlike :func:`jax.lax.while_loop`, ``fori_loop`` supports reverse-mode
-  differentiation, so ``jax.grad`` flows through the returned ``root``.
+* Iteration uses :func:`jax.lax.while_loop`, so it stops as soon as every
+  element has converged (returning the best estimate found).  This supports
+  forward-mode differentiation (:func:`jax.jvp`), but not reverse-mode
+  :func:`jax.grad`.
 * Results are returned as a :class:`RootResult` Equinox module, which JAX treats
   as a pytree.
 * The callable ``f`` is invoked as ``f(x, *args)``, so extra arguments (e.g.
@@ -15,10 +16,10 @@ Note on JIT: ``f`` (and ``df`` for :func:`newton`) are Python callables, not
 arrays, so when using ``jax.jit`` they must be closed over or marked static,
 e.g. ``jax.jit(lambda x0: newton(f, df, x0))``.
 
-Root finding is a fixed point; ``jax.grad`` differentiates the *converged
-iterate*.  For a smooth fixed point (Newton's method on a well-behaved
-function) this recovers the implicit-function-theorem derivative.  See the test
-suite for an example.
+Root finding is a fixed point; forward-mode differentiation differentiates the
+*converged iterate*.  For a smooth fixed point (Newton's method on a
+well-behaved function) this recovers the implicit-function-theorem derivative.
+See the test suite for an example.
 """
 
 from __future__ import annotations
@@ -55,10 +56,6 @@ class RootResult(eqx.Module):
     converged: jax.Array
 
 
-def _iters_and_done(shape: Tuple[int, ...]) -> Tuple[Any, Any]:
-    return jnp.zeros(shape, dtype=jnp.int32), jnp.zeros(shape, dtype=jnp.bool_)
-
-
 def bisection(
     f: Callable[..., Any],
     a: Any,
@@ -90,7 +87,7 @@ def bisection(
         Absolute tolerance on the root's x-position (the bracket width
         ``b - a``) for convergence.
     maxiter : int, optional
-        Maximum number of iterations (a static ``jax.lax.fori_loop`` bound).
+        Maximum number of iterations (a bound on the ``while_loop``).
     fa : array_like, optional
         Precomputed ``f(a, *args)``.  If omitted, it is evaluated here.
     fb : array_like, optional
@@ -106,8 +103,9 @@ def bisection(
     -----
     Bisection converges linearly and is guaranteed for any continuous ``f``
     with a sign change on ``[a, b]``, but is slower than :func:`brent`.  The
-    routine is jittable, vmappable and differentiable; when JIT-ing, close
-    over ``f``, e.g. ``jax.jit(lambda a, b: bisection(f, a, b))``.
+    routine is jittable, vmappable and supports forward-mode differentiation
+    (:func:`jax.jvp`), but not reverse-mode :func:`jax.grad`; when JIT-ing,
+    close over ``f``, e.g. ``jax.jit(lambda a, b: bisection(f, a, b))``.
 
     See Also
     --------
@@ -122,10 +120,14 @@ def bisection(
     shape = jnp.shape(fa)
     a = jnp.broadcast_to(a, shape)
     b = jnp.broadcast_to(b, shape)
-    iters, done = _iters_and_done(shape)
+    done0 = jnp.zeros(shape, dtype=jnp.bool_)
 
-    def body(i: int, state: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        a, b, fa, fb, iters, done = state
+    def cond(state: Tuple[Any, ...]) -> Any:
+        a, b, fa, fb, done, i = state
+        return jnp.any(~done) & (i < maxiter)
+
+    def body(state: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        a, b, fa, fb, done, i = state
         c = 0.5 * (a + b)
         fc = f(c, *args)
         same_sign = fa * fc > 0
@@ -133,17 +135,14 @@ def bisection(
         b = jnp.where(same_sign, b, c)
         fa = jnp.where(same_sign, fc, fa)
         fb = jnp.where(same_sign, fb, fc)
-        converged = b - a <= xtol
-        iters = iters + jnp.where(done, 0, 1)
+        converged = jnp.isnan(fa) | jnp.isnan(fb) | (b - a <= xtol)
         done = done | converged
-        return a, b, fa, fb, iters, done
+        return a, b, fa, fb, done, i + 1
 
-    a, b, fa, fb, iters, done = lax.fori_loop(
-        0, maxiter, body, (a, b, fa, fb, iters, done)
-    )
+    a, b, fa, fb, done, i = lax.while_loop(cond, body, (a, b, fa, fb, done0, 0))
     root = 0.5 * (a + b)
     value = f(root, *args)
-    return RootResult(root, value, iters, b - a <= xtol)
+    return RootResult(root, value, i, b - a <= xtol)
 
 
 def newton(
@@ -342,7 +341,7 @@ def secant(
         Absolute tolerance on the root's x-position (the step size).  Opt-in:
         ``None`` disables this criterion.
     maxiter : int, optional
-        Maximum number of iterations (a static ``jax.lax.fori_loop`` bound).
+        Maximum number of iterations (a bound on the ``while_loop``).
 
     Returns
     -------
@@ -355,7 +354,8 @@ def secant(
     The secant method has superlinear convergence (order ~1.618) and is
     derivative-free, but may stall when ``f(x_k) ≈ f(x_{k-1})`` (guarded by
     leaving the iterate unchanged).  The routine is jittable, vmappable and
-    differentiable; when JIT-ing, close over ``f``.
+    supports forward-mode differentiation (:func:`jax.jvp`), but not
+    reverse-mode :func:`jax.grad`; when JIT-ing, close over ``f``.
 
     See Also
     --------
@@ -368,27 +368,28 @@ def secant(
     shape = jnp.shape(f0)
     x0 = jnp.broadcast_to(x0, shape)
     x1 = jnp.broadcast_to(x1, shape)
-    iters, done = _iters_and_done(shape)
+    done0 = jnp.zeros(shape, dtype=jnp.bool_)
 
-    def body(i: int, state: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        x0, x1, f0, f1, iters, done = state
+    def cond(state: Tuple[Any, ...]) -> Any:
+        x0, x1, f0, f1, done, i = state
+        return jnp.any(~done) & (i < maxiter)
+
+    def body(state: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        x0, x1, f0, f1, done, i = state
         denom = f1 - f0
         x2 = jnp.where(denom == 0, x1, x1 - f1 * (x1 - x0) / denom)
         f2 = f(x2, *args)
-        converged = jnp.abs(f1) <= ftol
+        converged = jnp.isnan(f1) | (jnp.abs(f1) <= ftol)
         if xtol is not None:
             converged = converged | (jnp.abs(x2 - x1) <= xtol)
-        iters = iters + jnp.where(done, 0, 1)
         done = done | converged
-        return x1, x2, f1, f2, iters, done
+        return x1, x2, f1, f2, done, i + 1
 
-    x0, x1, f0, f1, iters, done = lax.fori_loop(
-        0, maxiter, body, (x0, x1, f0, f1, iters, done)
-    )
+    x0, x1, f0, f1, done, i = lax.while_loop(cond, body, (x0, x1, f0, f1, done0, 0))
     converged = jnp.abs(f1) <= ftol
     if xtol is not None:
         converged = converged | (jnp.abs(x1 - x0) <= xtol)
-    return RootResult(x1, f1, iters, converged)
+    return RootResult(x1, f1, i, converged)
 
 
 def brent(
@@ -422,7 +423,7 @@ def brent(
         Absolute tolerance on the root's x-position (the bracket width) for
         convergence.
     maxiter : int, optional
-        Maximum number of iterations (a static ``jax.lax.fori_loop`` bound).
+        Maximum number of iterations (a bound on the ``while_loop``).
     fa : array_like, optional
         Precomputed ``f(a, *args)``.  If omitted, it is evaluated here.
     fb : array_like, optional
@@ -439,7 +440,8 @@ def brent(
     Brent's method is the recommended general-purpose bracketed solver: it
     converges at least as fast as bisection and typically much faster, while
     never leaving the bracketing interval.  The routine is jittable, vmappable
-    and differentiable; when JIT-ing, close over ``f``.
+    and supports forward-mode differentiation (:func:`jax.jvp`), but not
+    reverse-mode :func:`jax.grad`; when JIT-ing, close over ``f``.
 
     See Also
     --------
@@ -455,10 +457,14 @@ def brent(
     a = jnp.broadcast_to(a, shape)
     b = jnp.broadcast_to(b, shape)
     zero = jnp.zeros(shape)
-    iters, done = _iters_and_done(shape)
+    done0 = jnp.zeros(shape, dtype=jnp.bool_)
 
-    def body(i: int, state: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        pre, cur, blk, fpre, fcur, fblk, spre, scur, iters, done = state
+    def cond(state: Tuple[Any, ...]) -> Any:
+        *_, done, i = state
+        return jnp.any(~done) & (i < maxiter)
+
+    def body(state: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        pre, cur, blk, fpre, fcur, fblk, spre, scur, done, i = state
 
         # Maintain the most recent bracket: if the last two points bracket a
         # root, record them.
@@ -482,7 +488,7 @@ def brent(
 
         delta = 0.5 * xtol
         sbis = 0.5 * (blk - cur)
-        converged = (fcur == 0.0) | (jnp.abs(sbis) < delta)
+        converged = jnp.isnan(fcur) | (fcur == 0.0) | (jnp.abs(sbis) < delta)
 
         # Choose between inverse quadratic interpolation, secant, and bisection.
         use_interp = (jnp.abs(spre) > delta) & (jnp.abs(fcur) < jnp.abs(fpre))
@@ -511,13 +517,12 @@ def brent(
         cur = cur + step
         fcur = f(cur, *args)
 
-        iters = iters + jnp.where(done, 0, 1)
         done = done | converged
-        return pre, cur, blk, fpre, fcur, fblk, spre, scur, iters, done
+        return pre, cur, blk, fpre, fcur, fblk, spre, scur, done, i + 1
 
-    init = (a, b, zero, fa, fb, zero, zero, zero, iters, done)
-    pre, cur, blk, fpre, fcur, fblk, spre, scur, iters, done = lax.fori_loop(
-        0, maxiter, body, init
+    init = (a, b, zero, fa, fb, zero, zero, zero, done0, 0)
+    pre, cur, blk, fpre, fcur, fblk, spre, scur, done, i = lax.while_loop(
+        cond, body, init
     )
     converged = (fcur == 0.0) | (jnp.abs(blk - cur) < xtol)
-    return RootResult(cur, fcur, iters, converged)
+    return RootResult(cur, fcur, i, converged)

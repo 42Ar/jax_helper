@@ -98,6 +98,22 @@ def test_secant_atol_x_tolerance():
     np.testing.assert_allclose(res.root, CBRT_2, atol=1e-10)
 
 
+def test_brent_returns_root_not_endpoint():
+    # Regression: with an unreachable xtol in float32, brent used to land
+    # exactly on the root, then keep iterating (bisection fallback) and drift
+    # back to a bracket endpoint, discarding the root it had already found.  It
+    # must return the best estimate (smallest |f|), not an endpoint.
+    jax.config.update("jax_enable_x64", False)
+    try:
+        f = lambda x: (x - 1.0) * (x - 2.0) * (x - 3.0)
+        res = brent(f, jnp.float32(0.99999994), jnp.float32(1.04999995),
+                    xtol=1e-10, maxiter=100)
+        assert float(jnp.abs(res.value)) < 1e-6
+        np.testing.assert_allclose(res.root, 1.0, atol=1e-5)
+    finally:
+        jax.config.update("jax_enable_x64", True)
+
+
 # --------------------------------------------------------------------------- #
 # JIT: compiled routines agree with eager execution
 # --------------------------------------------------------------------------- #
