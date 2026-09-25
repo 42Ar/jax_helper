@@ -232,14 +232,17 @@ def _polish(x: Any, f: Callable[..., Any], args: Tuple[Any, ...],
     # When an x-tolerance is requested, disable the |f| criterion so the x-step
     # controls the refinement; otherwise polish on |f| with prox_tol.
     ftol = prox_tol if xtol is None else 0.0
-    if method == "newton":
-        df = jax.vmap(jax.grad(lambda z: f(z, *args)))
-        return newton(f, lambda x, *a: df(x), x, args, ftol=ftol, xtol=xtol,
-                      maxiter=maxiter).root
-    elif method == "steffensen":
-        return steffensen(f, x, args, ftol=ftol, xtol=xtol, maxiter=maxiter).root
-    else:
-        raise ValueError(f"unknown polish method: {method!r}")
+
+    def polish_one(xi: Any) -> Any:
+        if method == "newton":
+            return newton(f, jax.grad(f), xi, args, ftol=ftol, xtol=xtol,
+                          maxiter=maxiter).root
+        elif method == "steffensen":
+            return steffensen(f, xi, args, ftol=ftol, xtol=xtol, maxiter=maxiter).root
+        else:
+            raise ValueError(f"unknown polish method: {method!r}")
+
+    return jax.vmap(polish_one)(x)
 
 
 def roots_chebyshev(
