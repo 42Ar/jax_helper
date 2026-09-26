@@ -587,3 +587,55 @@ def steffensen_python(
         fx = f(x, *args)
         dx = abs(step)
     return np.nan
+
+
+def steffensen_python_vmapped(
+    f_vmapped: Callable[..., Any],
+    x0: Any,
+    args: Tuple[Any, ...] = (),
+    ftol: float = None,
+    xtol: float = None,
+    maxiter: int = 50,
+    slope: Any = 1.0,
+) -> np.ndarray:
+    """Pure-Python (eager) Steffensen's method, vectorised over many starts.
+
+    Concurrently refines each entry of ``x0`` via Steffensen's method, using
+    ``f_vmapped`` (called as ``f_vmapped(x, *args)`` with ``x`` an array) to
+    evaluate ``f`` on the whole active batch at once.  ``slope`` is a
+    characteristic slope of ``f`` (a scalar, or one value per start) used to
+    rescale the finite-difference step ``f(x)/slope`` into x-units.  Returns an
+    array of roots, with ``NaN`` for starts that did not converge.
+    """
+    x = np.atleast_1d(np.asarray(x0)).astype(float).copy()
+    slope = np.broadcast_to(np.asarray(slope, dtype=x.dtype), x.shape)
+    if x.size == 0:
+        return x
+    fx = np.asarray(f_vmapped(x, *args), dtype=x.dtype).copy()
+    if ftol is None:
+        ftol = 100.0 * np.finfo(fx.dtype).eps
+    dx = np.full_like(x, np.inf)
+    active = np.ones(x.shape, dtype=bool)
+    for _ in range(maxiter):
+        active &= ~(np.isnan(fx) | (np.abs(fx) <= ftol))
+        if xtol is not None:
+            active &= ~(dx <= xtol)
+        if not active.any():
+            break
+        h = fx[active] / slope[active]
+        denom = np.asarray(f_vmapped(x[active] + h, *args)) - fx[active]
+        stuck = denom == 0.0
+        safe_denom = np.where(stuck, 1.0, denom)
+        step = fx[active] * fx[active] / (slope[active] * safe_denom)
+        new_x = np.where(stuck, x[active], x[active] - step)
+        new_fx = np.empty(active.sum(), dtype=fx.dtype)
+        nstuck = ~stuck
+        new_fx[nstuck] = np.asarray(f_vmapped(new_x[nstuck], *args))
+        new_fx[stuck] = np.nan
+        x[active] = new_x
+        fx[active] = new_fx
+        dx[active] = np.where(stuck, np.inf, np.abs(step))
+    converged = ~np.isnan(fx) & (np.abs(fx) <= ftol)
+    if xtol is not None:
+        converged = converged | (dx <= xtol)
+    return np.where(converged, x, np.nan)

@@ -34,6 +34,7 @@ from .root_finding import (
     newton_python,
     steffensen,
     steffensen_python,
+    steffensen_python_vmapped,
 )
 
 
@@ -820,13 +821,16 @@ def roots_chebyshev_recursive_python(
         return np.asarray(df(np.asarray([x]), *a))[0]
 
     polished = []
-    for xi, slope_i in roots:
-        if polish == "newton":
+    if polish == "newton":
+        for xi, _ in roots:
             root = newton_python(f_scalar, df_scalar, xi, args, ftol=ftol, xtol=xtol, maxiter=maxiter)
-        else:
-            root = steffensen_python(f_scalar, xi, args, ftol=ftol, xtol=xtol,
-                                     maxiter=maxiter, slope=slope_i)
-        polished.append(np.asarray(root)[()])
+            polished.append(np.asarray(root)[()])
+    else:
+        if len(roots) > 0:
+            root_arr = np.array([r for r, _ in roots], dtype=float)
+            slope_arr = np.array([s for _, s in roots], dtype=float)
+            result = steffensen_python_vmapped(f_vmapped, root_arr, args, ftol=ftol, xtol=xtol, maxiter=maxiter, slope=slope_arr)
+            polished = list(result)
 
     order = np.argsort(np.asarray(polished))
     polished = [polished[i] for i in order]

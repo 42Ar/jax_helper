@@ -15,6 +15,7 @@ from .root_finding import (
     secant,
     steffensen,
     steffensen_python,
+    steffensen_python_vmapped,
 )
 
 __all__ = [
@@ -30,5 +31,6 @@ __all__ = [
     "secant",
     "steffensen",
     "steffensen_python",
+    "steffensen_python_vmapped",
 ]
 __version__ = "0.1.0"

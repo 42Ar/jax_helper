@@ -11,6 +11,7 @@ from jax_helper import (
     secant,
     steffensen,
     steffensen_python,
+    steffensen_python_vmapped,
 )
 
 jax.config.update("jax_enable_x64", True)
@@ -307,3 +308,43 @@ def test_steffensen_slope_rescales_perturbation():
     np.testing.assert_allclose(
         steffensen_python(f, 1.0, ftol=1e-10, slope=1e6), 2.0, atol=1e-8
     )
+
+
+# --------------------------------------------------------------------------- #
+# steffensen_python_vmapped
+# --------------------------------------------------------------------------- #
+
+def test_steffensen_python_vmapped():
+    f = jax.vmap(lambda x: x**3 - 2.0)
+    x0 = np.array([1.2, 1.3, 1.4], dtype=float)
+    res = steffensen_python_vmapped(f, x0, ftol=1e-10)
+    assert not np.any(np.isnan(res))
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-8)
+
+
+def test_steffensen_python_vmapped_nonconvergence():
+    f = jax.vmap(lambda x: x**2 + 1.0)
+    x0 = np.array([-2.0, 0.0, 2.0], dtype=float)
+    res = steffensen_python_vmapped(f, x0, ftol=1e-10)
+    assert np.all(np.isnan(res))
+
+
+def test_steffensen_python_vmapped_scalar():
+    f = jax.vmap(lambda x: x**3 - 2.0)
+    res = steffensen_python_vmapped(f, np.array([1.5]), ftol=1e-10)
+    assert res.shape == (1,)
+    np.testing.assert_allclose(res[0], CBRT_2, atol=1e-8)
+
+
+def test_steffensen_python_vmapped_empty():
+    res = steffensen_python_vmapped(lambda x: x, np.array([]), ftol=1e-10)
+    assert res.shape == (0,)
+
+
+def test_steffensen_python_vmapped_slope():
+    f = jax.vmap(lambda x: (x - 1.0) * (x - 2.0) * (x - 3.0))
+    x0 = np.array([0.5, 0.8], dtype=float)
+    for slope in (0.5, 1.0, 2.0):
+        res = steffensen_python_vmapped(f, x0, ftol=1e-10, slope=slope)
+        assert not np.any(np.isnan(res))
+        np.testing.assert_allclose(res, 1.0, atol=1e-8)
