@@ -24,25 +24,31 @@ from typing import Any, Callable, Tuple
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
-from .root_finding import bisection, brent, newton, steffensen
+from .root_finding import (
+    bisection,
+    brent,
+    newton,
+    newton_python,
+    steffensen,
+    steffensen_python,
+)
 
 
 class MultiRootResult(eqx.Module):
     """Result of the multi-root routines (:func:`roots_chebyshev`,
     :func:`roots_chebyshev_recursive`, :func:`roots_scan`).
 
-    An Equinox module (and JAX pytree) holding the array of real roots found,
-    the function values there, a validity mask and the total root count.
+    An Equinox module (and JAX pytree) holding the array of real roots found, a
+    validity mask and the total root count.
 
     Attributes
     ----------
     roots : array_like
         Real roots of ``f`` in ``[a, b]``, ascending, NaN-padded to width
         ``n_max``.
-    values : array_like
-        ``f(roots)`` (NaN where ``roots`` is NaN).
     valid : array_like of bool
         Boolean mask marking the filled (non-NaN) root slots.
     count : array_like
@@ -50,7 +56,6 @@ class MultiRootResult(eqx.Module):
     """
 
     roots: jax.Array
-    values: jax.Array
     valid: jax.Array
     count: jax.Array
 
@@ -159,8 +164,9 @@ def _roots_from_proxy(c: Any, m: Any, a: Any, b: Any, n_max: int) -> Any:
     e = jnp.linalg.eigvals(a_mat)
     re = jnp.real(e)
     im = jnp.imag(e)
-    imag_tol = 100.0 * jnp.finfo(c.dtype).eps
-    keep = (jnp.abs(im) < imag_tol) & (jnp.abs(re) <= 1.0)
+    eps = jnp.finfo(c.dtype).eps
+    imag_tol = 100.0 * eps
+    keep = (jnp.abs(im) < imag_tol) & (jnp.abs(re) <= 1.0 + 1e4 * eps)
     x = (a + b) / 2 + (b - a) / 2 * re
     return jnp.where(keep, x, jnp.nan)
 
@@ -227,18 +233,52 @@ def _fit_batch(f: Callable[..., Any], lo: Any, hi: Any, edge_lo: Any, edge_hi: A
     return c, s
 
 
+def _extract_roots(c: Any, lo: Any, hi: Any, mask: Any, n: int) -> Any:
+    """Recover the real roots of the masked proxies in ``[lo, hi]``.
+
+    ``c`` is a ``(M, n + 1)`` coefficient matrix; ``mask`` selects the slots to
+    solve.  Returns a flat ``(M * n,)`` array of roots, NaN elsewhere.
+    """
+    m = _effective_degree_batch(c)
+    m = jnp.where(mask, m, -1)
+    m_safe = jnp.maximum(m, 1)
+    a_mat = _colleague_batch(c, m_safe, n, 2.0)
+    e = jnp.linalg.eigvals(a_mat)
+    re = jnp.real(e)
+    im = jnp.imag(e)
+    eps = jnp.finfo(c.dtype).eps
+    imag_tol = 100.0 * eps
+    x = (0.5 * (lo + hi))[:, None] + (0.5 * (hi - lo))[:, None] * re
+    keep = ((jnp.abs(im) < imag_tol) & (jnp.abs(re) <= 1.0 + 1e4 * eps)
+            & (m >= 1)[:, None])
+    return jnp.where(keep, x, jnp.nan).reshape(-1)
+
+
+def _merge_roots(out: Any, new: Any, tol: float, n_max: int) -> Any:
+    """Merge ``new`` roots into the ascending, NaN-padded accumulator ``out``.
+
+    ``tol`` is the near-duplicate tolerance; ``None`` disables deduplication.
+    """
+    combined = jnp.concatenate([out, new])
+    combined = jnp.sort(combined)
+    if tol is not None:
+        shifted = jnp.concatenate([jnp.full((1,), jnp.nan, dtype=combined.dtype),
+                                   combined[:-1]])
+        dup = jnp.abs(combined - shifted) < tol
+        combined = jnp.sort(jnp.where(dup, jnp.nan, combined))
+    return combined[:n_max]
+
+
 def _polish(x: Any, f: Callable[..., Any], args: Tuple[Any, ...],
-            prox_tol: float, xtol: float, maxiter: int, method: str) -> Any:
-    # When an x-tolerance is requested, disable the |f| criterion so the x-step
-    # controls the refinement; otherwise polish on |f| with prox_tol.
-    ftol = prox_tol if xtol is None else 0.0
+            ftol: float, xtol: float, maxiter: int, method: str) -> Any:
+    df = jax.grad(f) if method == "newton" else None
 
     def polish_one(xi: Any) -> Any:
         if method == "newton":
-            return newton(f, jax.grad(f), xi, args, ftol=ftol, xtol=xtol,
-                          maxiter=maxiter).root
+            return newton(f, df, xi, args, ftol=ftol, xtol=xtol,
+                          maxiter=maxiter)
         elif method == "steffensen":
-            return steffensen(f, xi, args, ftol=ftol, xtol=xtol, maxiter=maxiter).root
+            return steffensen(f, xi, args, ftol=ftol, xtol=xtol, maxiter=maxiter)
         else:
             raise ValueError(f"unknown polish method: {method!r}")
 
@@ -252,7 +292,8 @@ def roots_chebyshev(
     args: Tuple[Any, ...] = (),
     n0: int = 8,
     n_max: int = 128,
-    prox_tol: float = 1e-10,
+    prox_tol: float = 1e-6,
+    ftol: float = None,
     xtol: float = None,
     maxiter: int = 8,
     polish: str = "newton",
@@ -283,11 +324,14 @@ def roots_chebyshev(
         width of the output root array.
     prox_tol : float, optional
         Relative tolerance on the Chebyshev coefficient decay (the proxy's
-        accuracy).  This is a *desired* accuracy, clamped to the dtype's machine
-        precision.
+        accuracy).  Defaults to ``1e-6``.
+    ftol : float, optional
+        Absolute tolerance on ``|f(x)|`` applied during polish.  Defaults to a
+        few hundred times machine epsilon.
     xtol : float, optional
-        Absolute tolerance on each root's x-position, applied during polish.
-        Opt-in: ``None`` (default) polishes on ``|f|`` using ``prox_tol``.
+        Absolute tolerance on each root's x-position, applied during polish and
+        used as the deduplication threshold.  ``None`` (default) disables both
+        the x-criterion and deduplication.
     maxiter : int, optional
         Maximum number of polish iterations applied to each root.
     polish : {'newton', 'steffensen'}, optional
@@ -298,7 +342,7 @@ def roots_chebyshev(
     Returns
     -------
     MultiRootResult
-        Namedtuple with fields ``roots``, ``values``, ``valid`` and ``count``.
+        Namedtuple with fields ``roots``, ``valid`` and ``count``.
 
     Notes
     -----
@@ -318,21 +362,22 @@ def roots_chebyshev(
     roots_scan : Sign-change scan.
     bisection, brent, newton, secant, steffensen : Single-root methods.
     """
+    if ftol is None:
+        ftol = 100.0 * jnp.finfo(jnp.result_type(a, b, 1.0)).eps
     c, _ = _grow(f, a, b, args, n0, n_max, prox_tol)
     m = _effective_degree(c)
 
     def solve(_: Any) -> MultiRootResult:
         roots = _roots_from_proxy(c, m, a, b, n_max)
         roots = jnp.sort(roots)
-        roots = _polish(roots, f, args, prox_tol, xtol, maxiter, polish)
+        roots = _polish(roots, f, args, ftol, xtol, maxiter, polish)
         roots = jnp.sort(roots)
-        values = jax.vmap(lambda x: f(x, *args))(roots)
         valid = ~jnp.isnan(roots)
-        return MultiRootResult(roots, values, valid, valid.sum().astype(jnp.int32))
+        return MultiRootResult(roots, valid, valid.sum().astype(jnp.int32))
 
     def empty(_: Any) -> MultiRootResult:
         roots = jnp.full((n_max,), jnp.nan, dtype=c.dtype)
-        return MultiRootResult(roots, roots, jnp.zeros((n_max,), jnp.bool_),
+        return MultiRootResult(roots, jnp.zeros((n_max,), jnp.bool_),
                                jnp.int32(0))
 
     return lax.cond(m >= 1, solve, empty, operand=None)
@@ -344,10 +389,11 @@ def roots_chebyshev_recursive(
     b: Any,
     args: Tuple[Any, ...] = (),
     n: int = 8,
-    prox_tol: float = 1e-10,
+    prox_tol: float = 1e-6,
+    ftol: float = None,
     xtol: float = None,
     depth: int = 40,
-    max_nodes: int = 64,
+    max_nodes: int = 16,
     n_max: int = 128,
     maxiter: int = 8,
     polish: str = "newton",
@@ -382,15 +428,22 @@ def roots_chebyshev_recursive(
         sharing is available only for even ``n``).
     prox_tol : float, optional
         Relative tolerance on the Chebyshev coefficient decay (the local proxy's
-        accuracy).
+        accuracy).  Defaults to ``1e-6``.
+    ftol : float, optional
+        Absolute tolerance on ``|f(x)|`` applied during polish.  Defaults to a
+        few hundred times machine epsilon.
     xtol : float, optional
-        Absolute tolerance on each root's x-position, applied during polish.
-        Opt-in: ``None`` (default) polishes on ``|f|`` using ``prox_tol``.
+        Absolute tolerance on each root's x-position, applied during polish and
+        used as the deduplication threshold.  ``None`` (default) disables both
+        the x-criterion and deduplication.
     depth : int, optional
         Maximum number of subdivision iterations (an upper bound, rarely reached
         for smooth ``f``).
     max_nodes : int, optional
-        Fixed worklist size (maximum number of live subintervals).
+        Fixed worklist size: the maximum number of intervals awaiting
+        subdivision at once.  Completed intervals have their roots extracted
+        immediately, so ``max_nodes`` only needs to bound the active frontier
+        (not the total root count).
     n_max : int, optional
         Padded width of the output root array.
     maxiter : int, optional
@@ -402,16 +455,18 @@ def roots_chebyshev_recursive(
     Returns
     -------
     MultiRootResult
-        Namedtuple with fields ``roots``, ``values``, ``valid`` and ``count``.
+        Namedtuple with fields ``roots``, ``valid`` and ``count``.
 
     Notes
     -----
     Because JAX requires static shapes, the worklist is a fixed-size array of
-    ``max_nodes`` intervals; every interval is fitted (vectorised) at each
-    iteration, so for very simple functions :func:`roots_chebyshev` (degree
-    doubling) may use fewer evaluations.  The subdivision uses
-    :func:`jax.lax.while_loop`, so it stops once every interval is happy; it is
-    jittable and vmappable over ``args``, but not reverse-mode differentiable.
+    ``max_nodes`` *active* intervals; every active interval is fitted
+    (vectorised) at each iteration.  Completed (terminal) intervals are removed
+    from the worklist and their roots extracted into a fixed ``n_max``-wide
+    accumulator, so ``max_nodes`` bounds only the number of intervals being
+    subdivided at once.  The subdivision uses :func:`jax.lax.while_loop`, so it
+    stops once every interval is happy; it is jittable and vmappable over
+    ``args``, but not reverse-mode differentiable.
 
     The colleague-matrix eigenvalue extraction has the same close-root
     resolution limit as :func:`roots_chebyshev`: with the default ``n=8``, real
@@ -435,14 +490,16 @@ def roots_chebyshev_recursive(
     fa = f(a, *args)
     fb = f(b, *args)
     dtype = jnp.result_type(fa, fb, 1.0)
+    if ftol is None:
+        ftol = 100.0 * jnp.finfo(dtype).eps
 
+    # Active worklist: only intervals still needing subdivision (tag 0/1).
     lo = jnp.full((M,), jnp.nan, dtype=dtype)
     hi = jnp.full((M,), jnp.nan, dtype=dtype)
-    tag = jnp.zeros((M,), jnp.int32)          # 0 empty, 1 active, 2 terminal
+    tag = jnp.zeros((M,), jnp.int32)          # 0 empty, 1 active
     edge_lo = jnp.full((M,), jnp.nan, dtype=dtype)
     edge_hi = jnp.full((M,), jnp.nan, dtype=dtype)
     mid_val = jnp.full((M,), jnp.nan, dtype=dtype)
-    coeffs = jnp.zeros((M, n + 1), dtype=dtype)
 
     lo = lo.at[0].set(a)
     hi = hi.at[0].set(b)
@@ -450,10 +507,14 @@ def roots_chebyshev_recursive(
     edge_lo = edge_lo.at[0].set(fa)
     edge_hi = edge_hi.at[0].set(fb)
 
+    # Root accumulator: roots of terminal intervals are extracted immediately
+    # and merged here, so the worklist never needs to hold completed intervals.
+    out_roots = jnp.full((n_max,), jnp.nan, dtype=dtype)
+
     idx = jnp.arange(M)
 
     def body(state: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        lo, hi, tag, edge_lo, edge_hi, mid_val, coeffs, iters = state
+        lo, hi, tag, edge_lo, edge_hi, mid_val, out_roots, iters = state
         active = tag == 1
 
         safe_lo = jnp.where(active, lo, 0.0)
@@ -466,11 +527,17 @@ def roots_chebyshev_recursive(
         if n_even:
             mid_val = jnp.where(active, s[:, half_idx], mid_val)
 
-        already_terminal = tag == 2
-        terminal = already_terminal | (active & sufficient)
+        terminal = active & sufficient
         split = active & ~sufficient
 
-        coeffs = jnp.where(active[:, None], c, coeffs)
+        # Emit roots of terminal intervals straight into the accumulator.
+        def emit(_: Any) -> Any:
+            return _merge_roots(
+                out_roots, _extract_roots(c, safe_lo, safe_hi, terminal, n),
+                xtol, n_max,
+            )
+
+        out_roots = lax.cond(jnp.any(terminal), emit, lambda _: out_roots, operand=None)
 
         mid = 0.5 * (safe_lo + safe_hi)
         if n_even:
@@ -478,91 +545,304 @@ def roots_chebyshev_recursive(
         else:
             f_mid = jnp.where(split, f(mid, *args), jnp.nan)
 
-        # Expand each slot into two sub-slots, then compact the kept ones.
+        # Expand only the split intervals into two children, then compact.
         exp_lo = jnp.full((2 * M,), jnp.nan, dtype=lo.dtype)
         exp_hi = jnp.full((2 * M,), jnp.nan, dtype=lo.dtype)
-        exp_tag = jnp.zeros((2 * M,), jnp.int32)
         exp_elo = jnp.full((2 * M,), jnp.nan, dtype=lo.dtype)
         exp_ehi = jnp.full((2 * M,), jnp.nan, dtype=lo.dtype)
         exp_midv = jnp.full((2 * M,), jnp.nan, dtype=lo.dtype)
-        exp_coeffs = jnp.zeros((2 * M, n + 1), dtype=coeffs.dtype)
         exp_keep = jnp.zeros((2 * M,), jnp.bool_)
 
-        # sub-slot 2i: terminal interval or left child.
-        exp_lo = exp_lo.at[2 * idx].set(lo)
-        exp_hi = exp_hi.at[2 * idx].set(jnp.where(terminal, hi, mid))
-        exp_tag = exp_tag.at[2 * idx].set(jnp.where(terminal, 2, 1))
-        exp_elo = exp_elo.at[2 * idx].set(edge_lo)
-        exp_ehi = exp_ehi.at[2 * idx].set(jnp.where(terminal, edge_hi, f_mid))
-        exp_midv = exp_midv.at[2 * idx].set(jnp.where(terminal, mid_val, jnp.nan))
-        exp_coeffs = exp_coeffs.at[2 * idx].set(jnp.where(terminal[:, None], coeffs, 0.0))
-        exp_keep = exp_keep.at[2 * idx].set(terminal | split)
+        # sub-slot 2i: left child.
+        exp_lo = exp_lo.at[2 * idx].set(jnp.where(split, lo, jnp.nan))
+        exp_hi = exp_hi.at[2 * idx].set(jnp.where(split, mid, jnp.nan))
+        exp_elo = exp_elo.at[2 * idx].set(jnp.where(split, edge_lo, jnp.nan))
+        exp_ehi = exp_ehi.at[2 * idx].set(jnp.where(split, f_mid, jnp.nan))
+        exp_keep = exp_keep.at[2 * idx].set(split)
 
-        # sub-slot 2i+1: right child (split only).
-        exp_lo = exp_lo.at[2 * idx + 1].set(mid)
-        exp_hi = exp_hi.at[2 * idx + 1].set(hi)
-        exp_tag = exp_tag.at[2 * idx + 1].set(1)
-        exp_elo = exp_elo.at[2 * idx + 1].set(f_mid)
-        exp_ehi = exp_ehi.at[2 * idx + 1].set(edge_hi)
+        # sub-slot 2i+1: right child.
+        exp_lo = exp_lo.at[2 * idx + 1].set(jnp.where(split, mid, jnp.nan))
+        exp_hi = exp_hi.at[2 * idx + 1].set(jnp.where(split, hi, jnp.nan))
+        exp_elo = exp_elo.at[2 * idx + 1].set(jnp.where(split, f_mid, jnp.nan))
+        exp_ehi = exp_ehi.at[2 * idx + 1].set(jnp.where(split, edge_hi, jnp.nan))
         exp_keep = exp_keep.at[2 * idx + 1].set(split)
-
-        # Mask out non-kept sub-slots so only live intervals survive compaction.
-        exp_lo = jnp.where(exp_keep, exp_lo, jnp.nan)
-        exp_hi = jnp.where(exp_keep, exp_hi, jnp.nan)
-        exp_tag = jnp.where(exp_keep, exp_tag, 0)
-        exp_elo = jnp.where(exp_keep, exp_elo, jnp.nan)
-        exp_ehi = jnp.where(exp_keep, exp_ehi, jnp.nan)
-        exp_midv = jnp.where(exp_keep, exp_midv, jnp.nan)
 
         order = jnp.argsort(~exp_keep)
 
         def gather(arr: Any) -> Any:
             return arr[order][:M]
 
-        return (gather(exp_lo), gather(exp_hi), gather(exp_tag), gather(exp_elo),
-                gather(exp_ehi), gather(exp_midv), gather(exp_coeffs), iters + 1)
+        kept = exp_keep[order][:M]
+        return (gather(exp_lo), gather(exp_hi), jnp.where(kept, jnp.int32(1), jnp.int32(0)),
+                gather(exp_elo), gather(exp_ehi), gather(exp_midv),
+                out_roots, iters + 1)
 
     def cond(state: Tuple[Any, ...]) -> Any:
-        lo, hi, tag, edge_lo, edge_hi, mid_val, coeffs, iters = state
+        lo, hi, tag, edge_lo, edge_hi, mid_val, out_roots, iters = state
         return jnp.any(tag == 1) & (iters < depth)
 
-    init = (lo, hi, tag, edge_lo, edge_hi, mid_val, coeffs, jnp.int32(0))
-    lo, hi, tag, edge_lo, edge_hi, mid_val, coeffs, _ = lax.while_loop(cond, body, init)
+    init = (lo, hi, tag, edge_lo, edge_hi, mid_val, out_roots, jnp.int32(0))
+    lo, hi, tag, edge_lo, edge_hi, mid_val, out_roots, _ = lax.while_loop(cond, body, init)
 
-    # Re-fit any leftover active intervals (depth cap hit) so they have coeffs.
-    leftover = tag == 1
-    safe_lo = jnp.where(leftover, lo, 0.0)
-    safe_hi = jnp.where(leftover, hi, 0.0)
-    safe_elo = jnp.where(leftover, edge_lo, 0.0)
-    safe_ehi = jnp.where(leftover, edge_hi, 0.0)
-    refit_c, _ = _fit_batch(f, safe_lo, safe_hi, safe_elo, safe_ehi, args, n)
-    coeffs = jnp.where(leftover[:, None], refit_c, coeffs)
+    # Flush any leftover active intervals (depth cap hit).
+    def flush(_: Any) -> Any:
+        leftover = tag == 1
+        safe_lo = jnp.where(leftover, lo, 0.0)
+        safe_hi = jnp.where(leftover, hi, 0.0)
+        safe_elo = jnp.where(leftover, edge_lo, 0.0)
+        safe_ehi = jnp.where(leftover, edge_hi, 0.0)
+        refit_c, _ = _fit_batch(f, safe_lo, safe_hi, safe_elo, safe_ehi, args, n)
+        return _merge_roots(
+            out_roots, _extract_roots(refit_c, safe_lo, safe_hi, leftover, n),
+            xtol, n_max,
+        )
 
-    has_roots = tag >= 1
-    m = _effective_degree_batch(coeffs)
-    m_safe = jnp.maximum(m, 1)
-    a_mat = _colleague_batch(coeffs, m_safe, n, 2.0)
-    e = jnp.linalg.eigvals(a_mat)
-    re = jnp.real(e)
-    im = jnp.imag(e)
-    imag_tol = 100.0 * jnp.finfo(coeffs.dtype).eps
-    x = (0.5 * (lo + hi))[:, None] + (0.5 * (hi - lo))[:, None] * re
-    keep = ((jnp.abs(im) < imag_tol) & (x >= lo[:, None]) & (x <= hi[:, None])
-            & has_roots[:, None] & (m >= 1)[:, None])
-    roots = jnp.where(keep, x, jnp.nan).reshape(-1)
+    out_roots = lax.cond(jnp.any(tag == 1), flush, lambda _: out_roots, operand=None)
+
+    roots = _polish(out_roots, f, args, ftol, xtol, maxiter, polish)
     roots = jnp.sort(roots)
-
-    # Deduplicate boundary duplicates (close to a previous root).
-    shifted = jnp.concatenate([jnp.full((1,), jnp.nan), roots[:-1]])
-    dup = jnp.abs(roots - shifted) < prox_tol
-    roots = jnp.sort(jnp.where(dup, jnp.nan, roots))
-
-    roots = roots[:n_max]
-    roots = _polish(roots, f, args, prox_tol, xtol, maxiter, polish)
-    roots = jnp.sort(roots)
-    values = jax.vmap(lambda x: f(x, *args))(roots)
     valid = ~jnp.isnan(roots)
-    return MultiRootResult(roots, values, valid, valid.sum().astype(jnp.int32))
+    return MultiRootResult(roots, valid, valid.sum().astype(jnp.int32))
+
+
+def _cheb_coeffs_np(fk: np.ndarray) -> np.ndarray:
+    """Chebyshev coefficients from Lobatto samples via DCT-I (numpy)."""
+    n = fk.shape[0] - 1
+    idx = np.arange(n + 1)
+    m = np.cos(np.pi * idx[None, :] * idx[:, None] / n).astype(fk.dtype)
+    w = np.ones(n + 1, dtype=fk.dtype)
+    w[0] = 0.5
+    w[-1] = 0.5
+    c = (2.0 / n) * (m @ (w * fk))
+    c[0] *= 0.5
+    c[-1] *= 0.5
+    return c
+
+
+def _sufficient_np(c: np.ndarray, prox_tol: float) -> bool:
+    scale = np.max(np.abs(c))
+    tail = np.abs(c[-1]) + np.abs(c[-2])
+    n = c.shape[0] - 1
+    floor = 100.0 * np.finfo(c.dtype).eps * n
+    return bool(tail < np.maximum(prox_tol, floor) * scale)
+
+
+def _effective_degree_np(c: np.ndarray) -> int:
+    scale = np.max(np.abs(c))
+    thr = 100.0 * np.finfo(c.dtype).eps * scale * c.shape[0]
+    idx = np.arange(c.shape[0])
+    return int(np.max(np.where(np.abs(c) > thr, idx, -1)))
+
+
+def _roots_from_proxy_np(c: np.ndarray, m: int, lo: Any, hi: Any) -> np.ndarray:
+    """Real roots of the degree-``m`` proxy in ``[lo, hi]`` (numpy)."""
+    r = np.arange(m)
+    R = r[:, None]
+    S = r[None, :]
+    super_ = (S == R + 1)
+    sub_ = (S == R - 1)
+    last_row = (R == m - 1)
+    last_val = -c[:m] / (2.0 * c[m])
+    super_val = np.where((R == 0) & (S == 1), 1.0, 0.5)
+    a_mat = (np.where(super_, super_val, 0.0)
+             + np.where(sub_, 0.5, 0.0)
+             + np.where(last_row, last_val, 0.0))
+    e = np.linalg.eigvals(a_mat)
+    re = np.real(e)
+    im = np.imag(e)
+    eps = np.finfo(c.dtype).eps
+    imag_tol = 100.0 * eps
+    keep = (np.abs(im) < imag_tol) & (np.abs(re) <= 1.0 + 1e4 * eps)
+    x = 0.5 * (lo + hi) + 0.5 * (hi - lo) * re
+    return x[keep]
+
+
+def _cheb_deriv_coeffs_np(c: np.ndarray) -> np.ndarray:
+    """Coefficients of the derivative of a Chebyshev series (numpy)."""
+    n = c.shape[0] - 1
+    if n == 0:
+        return np.zeros(0, dtype=c.dtype)
+    d = np.zeros(n + 2, dtype=c.dtype)
+    for k in range(n - 1, 0, -1):
+        d[k] = 2.0 * (k + 1) * c[k + 1] + d[k + 2]
+    d[0] = c[1] + d[2] / 2.0
+    return d[:n]
+
+
+def _cheb_val_np(d: np.ndarray, t: Any) -> Any:
+    """Clenshaw evaluation of ``sum_k d_k T_k(t)`` (``t`` scalar or array)."""
+    t = np.asarray(t)
+    b1 = np.zeros_like(t)
+    b2 = np.zeros_like(t)
+    for k in range(d.shape[0] - 1, 0, -1):
+        b1, b2 = d[k] + 2.0 * t * b1 - b2, b1
+    return d[0] + t * b1 - b2
+
+
+def _slopes_np(c: np.ndarray, lo: Any, hi: Any, r: np.ndarray) -> np.ndarray:
+    """Characteristic slope ``|p'(r)|`` of the proxy at each root ``r``.
+
+    The derivative is taken analytically from the Chebyshev coefficients; a
+    fixed epsilon floor keeps it bounded away from zero.
+    """
+    d = _cheb_deriv_coeffs_np(c)
+    eps = np.finfo(c.dtype).eps
+    if d.shape[0] == 0:
+        return np.full(r.shape, 100.0 * eps)
+    half = 0.5 * (hi - lo)
+    t = (r - 0.5 * (lo + hi)) / half
+    slope = np.abs(_cheb_val_np(d, t)) / half
+    return np.maximum(slope, 100.0 * eps)
+
+
+def roots_chebyshev_recursive_python(
+    f_vmapped: Callable[..., Any],
+    a: Any,
+    b: Any,
+    args: Tuple[Any, ...] = (),
+    df: Callable[..., Any] = None,
+    n: int = 8,
+    prox_tol: float = 1e-6,
+    ftol: float = None,
+    xtol: float = None,
+    depth: int = 40,
+    maxiter: int = 8,
+    polish: str = "steffensen",
+) -> MultiRootResult:
+    """Pure-Python adaptive-subdivision root finder (same algorithm as
+    :func:`roots_chebyshev_recursive`, eager control flow).
+
+    This is a non-jittable twin of :func:`roots_chebyshev_recursive`: the
+    subdivision runs as ordinary Python loops over a dynamically-sized list of
+    intervals, so there is no fixed ``max_nodes`` worklist and no padding
+    waste.  ``f_vmapped`` must be callable as ``f_vmapped(x, *args)`` where
+    ``x`` is an array of points, returning an array of the same shape (i.e.
+    ``f`` already vectorised over its first argument); no ``vmap``/``jit`` is
+    applied here.
+
+    Parameters mirror :func:`roots_chebyshev_recursive` except ``max_nodes``
+    and ``n_max``, which do not exist here, plus:
+
+    df : callable, optional
+        Derivative of ``f`` w.r.t. its first argument, vectorised like
+        ``f_vmapped`` (``df(x, *args)`` with ``x`` an array).  Required iff
+        ``polish == 'newton'``.
+    polish : {'steffensen', 'newton'}
+        Polish method.  ``'steffensen'`` (default) is derivative-free;
+        ``'newton'`` additionally requires ``df``.  With ``'steffensen'``, the
+        slope used to rescale the finite-difference step is taken from the
+        analytic derivative of each interval's Chebyshev proxy (floored at a
+        fixed multiple of machine epsilon).
+
+    Unlike the jitted routine, this function is *not* differentiable and
+    cannot be ``vmap``'d over ``args``; use it when you want minimal ``f``
+    evaluations in eager mode.
+
+    Returns
+    -------
+    MultiRootResult
+        Namedtuple with fields ``roots``, ``valid`` and ``count``.
+        The result is *not* NaN-padded: ``roots`` has exactly ``count`` entries
+        (ascending order).  A ``NaN`` entry marks a suspected root whose polish
+        did not converge (``valid`` is ``False`` there).
+    """
+    if polish not in ("newton", "steffensen"):
+        raise ValueError(f"unknown polish method: {polish!r}")
+    if polish == "newton" and df is None:
+        raise ValueError("polish='newton' requires df (the derivative of f w.r.t. x)")
+
+    def checked_f_vmapped(x: Any) -> Any:
+        y = np.asarray(f_vmapped(x, *args))
+        if np.any(np.isnan(y)):
+            bad = np.asarray(x)[np.isnan(y)]
+            raise ValueError(f"f_vmapped returned NaN at x = {bad}")
+        return y
+
+    n_even = (n % 2 == 0)
+    half_idx = n // 2
+
+    ab = np.asarray([a, b])                       # (2,)
+    fab = checked_f_vmapped(ab)                   # (2,)
+    dtype = fab.dtype
+    if ftol is None:
+        ftol = 100.0 * np.finfo(dtype).eps
+    t = np.cos(np.pi * np.arange(1, n) / n).astype(dtype)   # (n-1,) cosines
+
+    a = np.asarray(ab[0], dtype=dtype)
+    b = np.asarray(ab[1], dtype=dtype)
+    fa = fab[0]
+    fb = fab[1]
+
+    frontier = [(a, b, fa, fb)]                      # (lo, hi, f(lo), f(hi))
+    roots = []                                       # (root, proxy-slope) pairs
+
+    for _ in range(depth):
+        if not frontier:
+            break
+        F = len(frontier)
+        los = np.array([it[0] for it in frontier])
+        his = np.array([it[1] for it in frontier])
+        flos = np.array([it[2] for it in frontier])
+        fhis = np.array([it[3] for it in frontier])
+
+        mid = 0.5 * (los + his)
+        half = 0.5 * (his - los)
+        xs = mid[:, None] + half[:, None] * t[None, :]        # (F, n-1)
+        fx = checked_f_vmapped(xs.reshape(-1)).reshape(F, n - 1)   # (F, n-1)
+        s = np.concatenate([fhis[:, None], fx, flos[:, None]], axis=-1)  # (F, n+1)
+
+        next_frontier = []
+        for i in range(F):
+            c = _cheb_coeffs_np(s[i])
+            if _sufficient_np(c, prox_tol):
+                m = _effective_degree_np(c)
+                if m >= 1:
+                    r = _roots_from_proxy_np(c, m, los[i], his[i])
+                    slope = _slopes_np(c, los[i], his[i], r)
+                    roots.extend(zip(r, slope))
+            else:
+                lo = los[i]
+                hi = his[i]
+                mi = 0.5 * (lo + hi)
+                if n_even:
+                    fmid = s[i, half_idx]
+                else:
+                    fmid = checked_f_vmapped(np.asarray([mi]))[0]
+                next_frontier.append((lo, mi, flos[i], fmid))
+                next_frontier.append((mi, hi, fmid, fhis[i]))
+        frontier = next_frontier
+
+    # Polish each raw root first (no NaN-padding polish), then deduplicate.
+    def f_scalar(x: Any, *a: Any) -> Any:
+        return np.asarray(f_vmapped(np.asarray([x]), *a))[0]
+
+    def df_scalar(x: Any, *a: Any) -> Any:
+        return np.asarray(df(np.asarray([x]), *a))[0]
+
+    polished = []
+    for xi, slope_i in roots:
+        if polish == "newton":
+            root = newton_python(f_scalar, df_scalar, xi, args, ftol=ftol, xtol=xtol, maxiter=maxiter)
+        else:
+            root = steffensen_python(f_scalar, xi, args, ftol=ftol, xtol=xtol,
+                                     maxiter=maxiter, slope=slope_i)
+        polished.append(np.asarray(root)[()])
+
+    order = np.argsort(np.asarray(polished))
+    polished = [polished[i] for i in order]
+
+    # Merge near-duplicates only when an x-resolution is requested.
+    if xtol is not None:
+        deduped = []
+        for r in polished:
+            if deduped and abs(r - deduped[-1]) < xtol:
+                continue
+            deduped.append(r)
+        polished = deduped
+
+    roots_arr = np.asarray(polished, dtype=dtype)
+    valid = ~np.isnan(roots_arr)
+    return MultiRootResult(roots_arr, valid, np.int32(valid.sum()))
 
 
 def roots_scan(
@@ -609,7 +889,7 @@ def roots_scan(
     Returns
     -------
     MultiRootResult
-        Namedtuple with fields ``roots``, ``values``, ``valid`` and ``count``.
+        Namedtuple with fields ``roots``, ``valid`` and ``count``.
 
     Notes
     -----
@@ -636,10 +916,12 @@ def roots_scan(
 
     solver = brent if method == "brent" else bisection
 
-    def refine(lo: Any, hi: Any, fa: Any, fb: Any) -> Any:
-        return solver(f, lo, hi, args, xtol=xtol, maxiter=maxiter, fa=fa, fb=fb).root
+    def refine(lo: Any, hi: Any, fa: Any, fb: Any, active: Any) -> Any:
+        fa = jnp.where(active, fa, jnp.nan)
+        fb = jnp.where(active, fb, jnp.nan)
+        return solver(f, lo, hi, args, xtol=xtol, maxiter=maxiter, fa=fa, fb=fb)
 
-    solved = jax.vmap(refine)(xs[:-1], xs[1:], fs[:-1], fs[1:])   # (n,)
+    solved = jax.vmap(refine)(xs[:-1], xs[1:], fs[:-1], fs[1:], change)   # (n,)
     roots_sub = jnp.where(change, solved, jnp.where(left_zero, xs[:-1], jnp.nan))
     right_root = jnp.where(right_zero, xs[-1], jnp.nan)
 
@@ -649,9 +931,6 @@ def roots_scan(
     # Merge near-duplicates (roots found from adjacent brackets).
     shifted = jnp.concatenate([jnp.full((1,), jnp.nan), roots[:-1]])
     dup = jnp.abs(roots - shifted) < xtol
-    roots = jnp.sort(jnp.where(dup, jnp.nan, roots))
-
-    roots = roots[:n_max]
-    values = jax.vmap(lambda x: f(x, *args))(roots)
+    roots = jnp.sort(jnp.where(dup, jnp.nan, roots))[:n_max]
     valid = ~jnp.isnan(roots)
-    return MultiRootResult(roots, values, valid, valid.sum().astype(jnp.int32))
+    return MultiRootResult(roots, valid, valid.sum().astype(jnp.int32))

@@ -7,8 +7,8 @@ Every routine here is written so that it composes cleanly with ``jax.jit``,
   element has converged (returning the best estimate found).  This supports
   forward-mode differentiation (:func:`jax.jvp`), but not reverse-mode
   :func:`jax.grad`.
-* Results are returned as a :class:`RootResult` Equinox module, which JAX treats
-  as a pytree.
+* Each routine returns the root as a scalar array, or ``NaN`` if it did not
+  converge within ``maxiter`` iterations.
 * The callable ``f`` is invoked as ``f(x, *args)``, so extra arguments (e.g.
   batched parameters) can be threaded through and vectorised with ``vmap``.
 
@@ -26,34 +26,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Tuple
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
-
-
-class RootResult(eqx.Module):
-    """Result of a root-finding routine.
-
-    An Equinox module (and JAX pytree) holding the computed root, the function
-    value there, the number of iterations taken and a convergence flag.
-
-    Attributes
-    ----------
-    root : array_like
-        Best estimate of the root.
-    value : array_like
-        Function value at ``root``, i.e. ``f(root, *args)``.
-    iterations : array_like
-        Number of iterations taken until convergence (capped at ``maxiter``).
-    converged : array_like of bool
-        Whether the tolerance criterion was met.
-    """
-
-    root: jax.Array
-    value: jax.Array
-    iterations: jax.Array
-    converged: jax.Array
 
 
 def bisection(
@@ -65,7 +41,7 @@ def bisection(
     maxiter: int = 100,
     fa: Any = None,
     fb: Any = None,
-) -> RootResult:
+) -> Any:
     """Find a root of ``f`` bracketed in ``[a, b]`` via the bisection method.
 
     Requires ``f(a)`` and ``f(b)`` to have opposite signs.  The interval is
@@ -95,9 +71,8 @@ def bisection(
 
     Returns
     -------
-    RootResult
-        Namedtuple with fields ``root``, ``value``, ``iterations`` and
-        ``converged``.
+    array_like
+        The root, or ``NaN`` if not converged.
 
     Notes
     -----
@@ -141,8 +116,7 @@ def bisection(
 
     a, b, fa, fb, done, i = lax.while_loop(cond, body, (a, b, fa, fb, done0, 0))
     root = 0.5 * (a + b)
-    value = f(root, *args)
-    return RootResult(root, value, i, b - a <= xtol)
+    return jnp.where(b - a <= xtol, root, jnp.nan)
 
 
 def newton(
@@ -150,10 +124,10 @@ def newton(
     df: Callable[..., Any],
     x0: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = 1e-5,
+    ftol: float = None,
     xtol: float = None,
     maxiter: int = 50,
-) -> RootResult:
+) -> Any:
     """Find a root of a scalar function via the Newton-Raphson method.
 
     Iterates ``x_{k+1} = x_k - f(x_k) / f'(x_k)`` from the initial guess
@@ -173,7 +147,8 @@ def newton(
     args : tuple, optional
         Extra positional arguments passed to ``f`` and ``df``.
     ftol : float, optional
-        Absolute tolerance on ``|f(x)|`` for convergence.
+        Absolute tolerance on ``|f(x)|`` for convergence.  Defaults to a few
+        hundred times machine epsilon.
     xtol : float, optional
         Absolute tolerance on the root's x-position (the step size
         ``|x_{k+1} - x_k|``).  Opt-in: ``None`` disables this criterion.
@@ -182,9 +157,8 @@ def newton(
 
     Returns
     -------
-    RootResult
-        Namedtuple with fields ``root``, ``value``, ``iterations`` and
-        ``converged``.
+    array_like
+        The root, or ``NaN`` if not converged.
 
     Notes
     -----
@@ -206,6 +180,8 @@ def newton(
     """
 
     fx0 = f(x0, *args)
+    if ftol is None:
+        ftol = 100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps
     x = jnp.broadcast_to(x0, jnp.shape(fx0))
     dx = jnp.full_like(x, jnp.inf)
 
@@ -221,30 +197,33 @@ def newton(
         d = df(x, *args)
         step = jnp.where(d == 0, 0.0, fx / d)
         x = x - step
-        return x, f(x, *args), jnp.abs(step), i + 1
+        dx = jnp.where(d == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))
+        return x, f(x, *args), dx, i + 1
 
     x, fx, dx, i = lax.while_loop(cond, body, (x, fx0, dx, 0))
     converged = jnp.abs(fx) <= ftol
     if xtol is not None:
         converged = converged | (dx <= xtol)
-    return RootResult(x, fx, i, converged)
+    return jnp.where(converged, x, jnp.nan)
 
 
 def steffensen(
     f: Callable[..., Any],
     x0: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = 1e-5,
+    ftol: float = None,
     xtol: float = None,
     maxiter: int = 50,
-) -> RootResult:
+    slope: float = 1.0,
+) -> Any:
     """Find a root of a scalar function via Steffensen's method.
 
     A derivative-free analogue of Newton's method with quadratic convergence.
-    It iterates ``x_{k+1} = x_k - f(x_k)^2 / (f(x_k + f(x_k)) - f(x_k))``, so
-    only ``f`` (never its derivative) is evaluated.  Convergence is declared
-    when ``|f(x)| <= ftol`` or, if ``xtol`` is given, when the step
-    ``|x_{k+1} - x_k| <= xtol``.
+    It approximates ``f'(x)`` by a one-sided finite difference with step
+    ``h = f(x) / slope`` and iterates ``x_{k+1} = x_k - f(x_k)^2 /
+    (slope * (f(x_k + f(x_k)/slope) - f(x_k)))``, so only ``f`` (never its
+    derivative) is evaluated.  Convergence is declared when ``|f(x)| <= ftol``
+    or, if ``xtol`` is given, when the step ``|x_{k+1} - x_k| <= xtol``.
 
     Parameters
     ----------
@@ -255,18 +234,23 @@ def steffensen(
     args : tuple, optional
         Extra positional arguments passed to ``f``.
     ftol : float, optional
-        Absolute tolerance on ``|f(x)|`` for convergence.
+        Absolute tolerance on ``|f(x)|`` for convergence.  Defaults to a few
+        hundred times machine epsilon.
     xtol : float, optional
         Absolute tolerance on the root's x-position (the step size).  Opt-in:
         ``None`` disables this criterion.
     maxiter : int, optional
         Maximum number of iterations (a bound on the ``while_loop``).
+    slope : float, optional
+        A characteristic slope of ``f`` (an estimate of ``|f'|``, in units of
+        ``f`` per unit of ``x``).  It rescales the finite-difference step
+        ``f(x)/slope`` into x-units; the default ``1.0`` recovers textbook
+        Steffensen.  Must be nonzero.
 
     Returns
     -------
-    RootResult
-        Namedtuple with fields ``root``, ``value``, ``iterations`` and
-        ``converged``.
+    array_like
+        The root, or ``NaN`` if not converged.
 
     Notes
     -----
@@ -285,6 +269,8 @@ def steffensen(
     """
 
     fx0 = f(x0, *args)
+    if ftol is None:
+        ftol = 100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps
     x = jnp.broadcast_to(x0, jnp.shape(fx0))
     dx = jnp.full_like(x, jnp.inf)
 
@@ -297,16 +283,17 @@ def steffensen(
 
     def body(state: Tuple[Any, Any, Any, Any]) -> Tuple[Any, Any, Any, Any]:
         x, fx, dx, i = state
-        denom = f(x + fx, *args) - fx
-        step = jnp.where(denom == 0, 0.0, fx * fx / denom)
+        denom = f(x + fx / slope, *args) - fx
+        step = jnp.where(denom == 0, 0.0, fx * fx / (slope * denom))
         x = x - step
-        return x, f(x, *args), jnp.abs(step), i + 1
+        dx = jnp.where(denom == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))
+        return x, f(x, *args), dx, i + 1
 
     x, fx, dx, i = lax.while_loop(cond, body, (x, fx0, dx, 0))
     converged = jnp.abs(fx) <= ftol
     if xtol is not None:
         converged = converged | (dx <= xtol)
-    return RootResult(x, fx, i, converged)
+    return jnp.where(converged, x, jnp.nan)
 
 
 def secant(
@@ -314,10 +301,10 @@ def secant(
     x0: Any,
     x1: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = 1e-5,
+    ftol: float = None,
     xtol: float = None,
     maxiter: int = 50,
-) -> RootResult:
+) -> Any:
     """Find a root of a scalar function via the secant method.
 
     Uses two starting points ``x0`` and ``x1`` and the recurrence
@@ -336,7 +323,8 @@ def secant(
     args : tuple, optional
         Extra positional arguments passed to ``f``.
     ftol : float, optional
-        Absolute tolerance on ``|f(x)|`` for convergence.
+        Absolute tolerance on ``|f(x)|`` for convergence.  Defaults to a few
+        hundred times machine epsilon.
     xtol : float, optional
         Absolute tolerance on the root's x-position (the step size).  Opt-in:
         ``None`` disables this criterion.
@@ -345,9 +333,8 @@ def secant(
 
     Returns
     -------
-    RootResult
-        Namedtuple with fields ``root``, ``value``, ``iterations`` and
-        ``converged``.
+    array_like
+        The root, or ``NaN`` if not converged.
 
     Notes
     -----
@@ -365,6 +352,8 @@ def secant(
 
     f0 = f(x0, *args)
     f1 = f(x1, *args)
+    if ftol is None:
+        ftol = 100.0 * jnp.finfo(jnp.asarray(f0).dtype).eps
     shape = jnp.shape(f0)
     x0 = jnp.broadcast_to(x0, shape)
     x1 = jnp.broadcast_to(x1, shape)
@@ -389,7 +378,7 @@ def secant(
     converged = jnp.abs(f1) <= ftol
     if xtol is not None:
         converged = converged | (jnp.abs(x1 - x0) <= xtol)
-    return RootResult(x1, f1, i, converged)
+    return jnp.where(converged, x1, jnp.nan)
 
 
 def brent(
@@ -401,7 +390,7 @@ def brent(
     maxiter: int = 100,
     fa: Any = None,
     fb: Any = None,
-) -> RootResult:
+) -> Any:
     """Find a root of ``f`` bracketed in ``[a, b]`` via Brent's method.
 
     Requires ``f(a)`` and ``f(b)`` to have opposite signs.  Brent's method
@@ -431,9 +420,8 @@ def brent(
 
     Returns
     -------
-    RootResult
-        Namedtuple with fields ``root``, ``value``, ``iterations`` and
-        ``converged``.
+    array_like
+        The root, or ``NaN`` if not converged.
 
     Notes
     -----
@@ -525,4 +513,77 @@ def brent(
         cond, body, init
     )
     converged = (fcur == 0.0) | (jnp.abs(blk - cur) < xtol)
-    return RootResult(cur, fcur, i, converged)
+    return jnp.where(converged, cur, jnp.nan)
+
+
+def newton_python(
+    f: Callable[..., Any],
+    df: Callable[..., Any],
+    x0: Any,
+    args: Tuple[Any, ...] = (),
+    ftol: float = None,
+    xtol: float = None,
+    maxiter: int = 50,
+) -> Any:
+    """Pure-Python (eager) Newton-Raphson method for scalar ``f``.
+
+    Identical convergence criteria to :func:`newton`, but the iteration is an
+    ordinary Python ``for`` loop over scalar values, so it is *not* jittable
+    and not vmappable.  ``f`` and ``df`` must be scalar callables
+    (``f(x, *args) -> scalar``, ``df(x, *args) -> scalar``).
+    """
+    x = x0
+    fx = f(x, *args)
+    if ftol is None:
+        ftol = 100.0 * np.finfo(np.asarray(fx).dtype).eps
+    dx = np.inf
+    for _ in range(maxiter):
+        if np.isnan(fx):
+            return np.nan
+        if abs(fx) <= ftol or (xtol is not None and dx <= xtol):
+            return x
+        d = df(x, *args)
+        if d == 0:
+            return np.nan
+        step = fx / d
+        x = x - step
+        fx = f(x, *args)
+        dx = abs(step)
+    return np.nan
+
+
+def steffensen_python(
+    f: Callable[..., Any],
+    x0: Any,
+    args: Tuple[Any, ...] = (),
+    ftol: float = None,
+    xtol: float = None,
+    maxiter: int = 50,
+    slope: float = 1.0,
+) -> Any:
+    """Pure-Python (eager) Steffensen's method for scalar ``f``.
+
+    Identical convergence criteria to :func:`steffensen`, but the iteration is
+    an ordinary Python ``for`` loop over scalar values, so it is *not* jittable
+    and not vmappable.  ``f`` must be a scalar callable
+    (``f(x, *args) -> scalar``).  ``slope`` is a characteristic slope of ``f``
+    used to rescale the finite-difference step ``f(x)/slope`` into x-units.
+    """
+    x = x0
+    fx = f(x, *args)
+    if ftol is None:
+        ftol = 100.0 * np.finfo(np.asarray(fx).dtype).eps
+    dx = np.inf
+    for _ in range(maxiter):
+        if np.isnan(fx):
+            return np.nan
+        if abs(fx) <= ftol or (xtol is not None and dx <= xtol):
+            return x
+        denom = f(x + fx / slope, *args) - fx
+        if denom == 0:
+            return np.nan
+        step = fx * fx / (slope * denom)
+        x = x - step
+        fx = f(x, *args)
+        dx = abs(step)
+    return np.nan

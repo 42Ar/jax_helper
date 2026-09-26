@@ -3,7 +3,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from jax_helper import RootResult, bisection, brent, newton, secant, steffensen
+from jax_helper import (
+    bisection,
+    brent,
+    newton,
+    newton_python,
+    secant,
+    steffensen,
+    steffensen_python,
+)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -35,67 +43,66 @@ OMEGA = 0.7390851332151607  # solution of cos(x) = x
 @pytest.mark.parametrize("root_fn", [bisection, brent])
 def test_bracketed_cubic(root_fn):
     res = root_fn(f_cubic, 0.0, 2.0, xtol=1e-10)
-    assert isinstance(res, RootResult)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, CBRT_2, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-8)
 
 
 @pytest.mark.parametrize("root_fn", [bisection, brent])
 def test_bracketed_transcendental(root_fn):
     res = root_fn(f_transcendental, 0.0, 1.5, xtol=1e-10)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, OMEGA, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, OMEGA, atol=1e-8)
 
 
 def test_newton_cubic():
     res = newton(f_cubic, df_cubic, 1.5, ftol=1e-10)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, CBRT_2, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-8)
 
 
 def test_newton_transcendental():
     res = newton(f_transcendental, df_transcendental, 0.7, ftol=1e-10)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, OMEGA, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, OMEGA, atol=1e-8)
 
 
 def test_secant_cubic():
     res = secant(f_cubic, 0.5, 2.0, ftol=1e-10)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, CBRT_2, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-8)
 
 
 def test_secant_transcendental():
     res = secant(f_transcendental, 0.5, 1.0, ftol=1e-10)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, OMEGA, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, OMEGA, atol=1e-8)
 
 
 def test_steffensen_cubic():
     res = steffensen(f_cubic, 1.5, ftol=1e-10)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, CBRT_2, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-8)
 
 
 def test_steffensen_transcendental():
     res = steffensen(f_transcendental, 0.7, ftol=1e-10)
-    assert bool(res.converged)
-    np.testing.assert_allclose(res.root, OMEGA, atol=1e-8)
+    assert not bool(jnp.isnan(res))
+    np.testing.assert_allclose(res, OMEGA, atol=1e-8)
 
 
 def test_newton_atol_x_tolerance():
     res = newton(f_cubic, df_cubic, 1.5, ftol=0.0, xtol=1e-10)
-    np.testing.assert_allclose(res.root, CBRT_2, atol=1e-10)
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-10)
 
 
 def test_steffensen_atol_x_tolerance():
     res = steffensen(f_cubic, 1.5, ftol=0.0, xtol=1e-10)
-    np.testing.assert_allclose(res.root, CBRT_2, atol=1e-10)
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-10)
 
 
 def test_secant_atol_x_tolerance():
     res = secant(f_cubic, 0.5, 2.0, ftol=0.0, xtol=1e-10)
-    np.testing.assert_allclose(res.root, CBRT_2, atol=1e-10)
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-10)
 
 
 def test_brent_returns_root_not_endpoint():
@@ -108,8 +115,8 @@ def test_brent_returns_root_not_endpoint():
         f = lambda x: (x - 1.0) * (x - 2.0) * (x - 3.0)
         res = brent(f, jnp.float32(0.99999994), jnp.float32(1.04999995),
                     xtol=1e-10, maxiter=100)
-        assert float(jnp.abs(res.value)) < 1e-6
-        np.testing.assert_allclose(res.root, 1.0, atol=1e-5)
+        assert float(jnp.abs(f(res))) < 1e-6
+        np.testing.assert_allclose(res, 1.0, atol=1e-5)
     finally:
         jax.config.update("jax_enable_x64", True)
 
@@ -121,32 +128,32 @@ def test_brent_returns_root_not_endpoint():
 def test_bisection_jit():
     eager = bisection(f_cubic, 0.0, 2.0)
     compiled = jax.jit(lambda a, b: bisection(f_cubic, a, b))(0.0, 2.0)
-    np.testing.assert_allclose(compiled.root, eager.root)
-    assert bool(compiled.converged)
+    np.testing.assert_allclose(compiled, eager)
+    assert not bool(jnp.isnan(compiled))
 
 
 def test_newton_jit():
     eager = newton(f_cubic, df_cubic, 1.5)
     compiled = jax.jit(lambda x0: newton(f_cubic, df_cubic, x0))(1.5)
-    np.testing.assert_allclose(compiled.root, eager.root)
+    np.testing.assert_allclose(compiled, eager)
 
 
 def test_secant_jit():
     eager = secant(f_cubic, 0.5, 2.0)
     compiled = jax.jit(lambda a, b: secant(f_cubic, a, b))(0.5, 2.0)
-    np.testing.assert_allclose(compiled.root, eager.root)
+    np.testing.assert_allclose(compiled, eager)
 
 
 def test_steffensen_jit():
     eager = steffensen(f_cubic, 1.5)
     compiled = jax.jit(lambda x0: steffensen(f_cubic, x0))(1.5)
-    np.testing.assert_allclose(compiled.root, eager.root)
+    np.testing.assert_allclose(compiled, eager)
 
 
 def test_brent_jit():
     eager = brent(f_transcendental, 0.0, 1.5)
     compiled = jax.jit(lambda a, b: brent(f_transcendental, a, b))(0.0, 1.5)
-    np.testing.assert_allclose(compiled.root, eager.root, atol=1e-8)
+    np.testing.assert_allclose(compiled, eager, atol=1e-8)
 
 
 # --------------------------------------------------------------------------- #
@@ -159,33 +166,33 @@ def g(x, c):
 
 def test_bisection_vmap():
     c = jnp.array([1.0, 8.0, 27.0, 64.0])
-    roots = jax.vmap(lambda ci: bisection(g, 0.0, 10.0, args=(ci,)).root)(c)
+    roots = jax.vmap(lambda ci: bisection(g, 0.0, 10.0, args=(ci,)))(c)
     np.testing.assert_allclose(roots, c ** (1.0 / 3.0), atol=1e-5)
 
 
 def test_newton_vmap():
     c = jnp.array([1.0, 8.0, 27.0, 64.0])
     dg = lambda x, c: 3.0 * x**2
-    roots = jax.vmap(lambda ci: newton(g, dg, 2.0, args=(ci,)).root)(c)
+    roots = jax.vmap(lambda ci: newton(g, dg, 2.0, args=(ci,)))(c)
     np.testing.assert_allclose(roots, c ** (1.0 / 3.0), atol=1e-5)
 
 
 def test_secant_vmap():
     c = jnp.array([1.0, 8.0, 27.0, 64.0])
-    roots = jax.vmap(lambda ci: secant(g, 0.5, 5.0, args=(ci,)).root)(c)
+    roots = jax.vmap(lambda ci: secant(g, 0.5, 5.0, args=(ci,)))(c)
     np.testing.assert_allclose(roots, c ** (1.0 / 3.0), atol=1e-5)
 
 
 def test_steffensen_vmap():
     c = jnp.array([1.0, 8.0, 27.0, 64.0])
     x0 = jnp.array([1.5, 2.5, 3.5, 4.5])
-    roots = jax.vmap(lambda ci, xi: steffensen(g, xi, args=(ci,)).root)(c, x0)
+    roots = jax.vmap(lambda ci, xi: steffensen(g, xi, args=(ci,)))(c, x0)
     np.testing.assert_allclose(roots, c ** (1.0 / 3.0), atol=1e-5)
 
 
 def test_brent_vmap():
     c = jnp.array([1.0, 8.0, 27.0, 64.0])
-    roots = jax.vmap(lambda ci: brent(g, 0.0, 10.0, args=(ci,)).root)(c)
+    roots = jax.vmap(lambda ci: brent(g, 0.0, 10.0, args=(ci,)))(c)
     np.testing.assert_allclose(roots, c ** (1.0 / 3.0), atol=1e-5)
 
 
@@ -204,7 +211,7 @@ def test_newton_grad_via_implicit_function_theorem():
         return 3.0 * x**2
 
     def root_of(c):
-        return newton(h, dh, jnp.sign(c) * 2.0, args=(c,), ftol=1e-12).root
+        return newton(h, dh, jnp.sign(c) * 2.0, args=(c,), ftol=1e-12)
 
     c = jnp.array([0.5, 1.0, 2.0])
     jac = jax.jacfwd(lambda c: jnp.sum(root_of(c)))(c)
@@ -219,9 +226,84 @@ def test_newton_grad_via_implicit_function_theorem():
 def test_nonconvergence_flag():
     # No root: f(x) = x^2 + 1 is always positive.  Secant should not converge.
     res = secant(lambda x: x**2 + 1.0, 0.0, 1.0, ftol=1e-12, maxiter=10)
-    assert not bool(res.converged)
+    assert bool(jnp.isnan(res))
 
 
 def test_maxiter_respected():
     res = newton(f_cubic, df_cubic, 1.5, ftol=1e-30, maxiter=3)
-    assert int(res.iterations) <= 3
+    assert bool(jnp.isnan(res))
+
+
+# --------------------------------------------------------------------------- #
+# Pure-Python (eager) solvers
+# --------------------------------------------------------------------------- #
+
+def test_newton_python_cubic():
+    res = newton_python(f_cubic, df_cubic, 1.5, ftol=1e-10)
+    assert not bool(np.isnan(res))
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-8)
+
+
+def test_newton_python_transcendental():
+    res = newton_python(f_transcendental, df_transcendental, 0.7, ftol=1e-10)
+    assert not bool(np.isnan(res))
+    np.testing.assert_allclose(res, OMEGA, atol=1e-8)
+
+
+def test_steffensen_python_cubic():
+    res = steffensen_python(f_cubic, 1.5, ftol=1e-10)
+    assert not bool(np.isnan(res))
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-8)
+
+
+def test_steffensen_python_transcendental():
+    res = steffensen_python(f_transcendental, 0.7, ftol=1e-10)
+    assert not bool(np.isnan(res))
+    np.testing.assert_allclose(res, OMEGA, atol=1e-8)
+
+
+def test_newton_python_xtol():
+    res = newton_python(f_cubic, df_cubic, 1.5, ftol=0.0, xtol=1e-10)
+    np.testing.assert_allclose(res, CBRT_2, atol=1e-10)
+
+
+def test_newton_zero_derivative_no_false_convergence():
+    # df(0) == 0 leaves the iterate unchanged; the guarded step (0) must not be
+    # mistaken for x-convergence via the xtol criterion.
+    f = lambda x: x**2 - 1.0
+    df = lambda x: 2.0 * x
+    assert bool(jnp.isnan(newton(f, df, 0.0, ftol=0.0, xtol=1e-10, maxiter=10)))
+    assert bool(np.isnan(newton_python(f, df, 0.0, ftol=0.0, xtol=1e-10, maxiter=10)))
+
+
+def test_steffensen_zero_denominator_no_false_convergence():
+    # f(x) = 1: f(x + fx) - fx == 0 exactly, so the guarded step (0) must not
+    # be mistaken for x-convergence via the xtol criterion.
+    f = lambda x: 1.0
+    assert bool(jnp.isnan(steffensen(f, 0.0, ftol=0.0, xtol=1e-10, maxiter=5)))
+    assert bool(np.isnan(steffensen_python(f, 0.0, ftol=0.0, xtol=1e-10, maxiter=5)))
+
+
+def test_steffensen_slope_parameter():
+    # ``slope`` rescales the finite-difference step f(x)/slope into x-units;
+    # the default (1.0) and several explicit slopes must all reach the same root.
+    f = lambda x: (x - 1.0) * (x - 2.0) * (x - 3.0)
+    for slope in (0.5, 1.0, 2.0, 4.0, 10.0):
+        np.testing.assert_allclose(
+            steffensen(f, 0.5, ftol=1e-10, slope=slope), 1.0, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            steffensen_python(f, 0.5, ftol=1e-10, slope=slope), 1.0, atol=1e-8
+        )
+
+
+def test_steffensen_slope_rescales_perturbation():
+    # A badly-scaled function f(x) = 1e6*(x-2); the characteristic slope (1e6)
+    # makes the finite-difference perturbation f(x)/slope an x-unit step.
+    f = lambda x: 1e6 * (x - 2.0)
+    np.testing.assert_allclose(
+        steffensen(f, 1.0, ftol=1e-10, slope=1e6), 2.0, atol=1e-8
+    )
+    np.testing.assert_allclose(
+        steffensen_python(f, 1.0, ftol=1e-10, slope=1e6), 2.0, atol=1e-8
+    )

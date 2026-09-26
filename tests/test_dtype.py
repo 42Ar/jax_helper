@@ -27,8 +27,8 @@ def _dtype():
 @pytest.mark.parametrize("solver", [bisection, brent])
 def test_bracketed_cubic(x64, solver):
     res = solver(lambda x: x**3 - 2.0, 0.0, 2.0, xtol=1e-5)
-    assert res.root.dtype == _dtype()
-    np.testing.assert_allclose(res.root, 2.0 ** (1.0 / 3.0), atol=1e-4)
+    assert res.dtype == _dtype()
+    np.testing.assert_allclose(res, 2.0 ** (1.0 / 3.0), atol=1e-4)
 
 
 # --------------------------------------------------------------------------- #
