@@ -50,7 +50,7 @@ class MultiRootResult(eqx.Module):
     count: jax.Array
 
 
-def _cheb_coeffs_np(fk: np.ndarray) -> np.ndarray:
+def _cheb_coeffs(fk: np.ndarray) -> np.ndarray:
     """Chebyshev coefficients from Lobatto samples via DCT-I (numpy)."""
     n = fk.shape[0] - 1
     idx = np.arange(n + 1)
@@ -64,7 +64,7 @@ def _cheb_coeffs_np(fk: np.ndarray) -> np.ndarray:
     return c
 
 
-def _sufficient_np(c: np.ndarray, prox_tol: float) -> bool:
+def _sufficient(c: np.ndarray, prox_tol: float) -> bool:
     scale = np.max(np.abs(c))
     tail = np.abs(c[-1]) + np.abs(c[-2])
     n = c.shape[0] - 1
@@ -72,14 +72,14 @@ def _sufficient_np(c: np.ndarray, prox_tol: float) -> bool:
     return bool(tail < np.maximum(prox_tol, floor) * scale)
 
 
-def _effective_degree_np(c: np.ndarray) -> int:
+def _effective_degree(c: np.ndarray) -> int:
     scale = np.max(np.abs(c))
     thr = 100.0 * np.finfo(c.dtype).eps * scale * c.shape[0]
     idx = np.arange(c.shape[0])
     return int(np.max(np.where(np.abs(c) > thr, idx, -1)))
 
 
-def _roots_from_proxy_np(c: np.ndarray, m: int, lo: Any, hi: Any) -> np.ndarray:
+def _roots_from_proxy(c: np.ndarray, m: int, lo: Any, hi: Any) -> np.ndarray:
     """Real roots of the degree-``m`` proxy in ``[lo, hi]`` (numpy)."""
     r = np.arange(m)
     R = r[:, None]
@@ -102,7 +102,7 @@ def _roots_from_proxy_np(c: np.ndarray, m: int, lo: Any, hi: Any) -> np.ndarray:
     return x[keep]
 
 
-def _cheb_deriv_coeffs_np(c: np.ndarray) -> np.ndarray:
+def _cheb_deriv_coeffs(c: np.ndarray) -> np.ndarray:
     """Coefficients of the derivative of a Chebyshev series (numpy)."""
     n = c.shape[0] - 1
     if n == 0:
@@ -114,7 +114,7 @@ def _cheb_deriv_coeffs_np(c: np.ndarray) -> np.ndarray:
     return d[:n]
 
 
-def _cheb_val_np(d: np.ndarray, t: Any) -> Any:
+def _cheb_val(d: np.ndarray, t: Any) -> Any:
     """Clenshaw evaluation of ``sum_k d_k T_k(t)`` (``t`` scalar or array)."""
     t = np.asarray(t)
     b1 = np.zeros_like(t)
@@ -124,19 +124,19 @@ def _cheb_val_np(d: np.ndarray, t: Any) -> Any:
     return d[0] + t * b1 - b2
 
 
-def _slopes_np(c: np.ndarray, lo: Any, hi: Any, r: np.ndarray) -> np.ndarray:
+def _slopes(c: np.ndarray, lo: Any, hi: Any, r: np.ndarray) -> np.ndarray:
     """Characteristic slope ``|p'(r)|`` of the proxy at each root ``r``.
 
     The derivative is taken analytically from the Chebyshev coefficients; a
     fixed epsilon floor keeps it bounded away from zero.
     """
-    d = _cheb_deriv_coeffs_np(c)
+    d = _cheb_deriv_coeffs(c)
     eps = np.finfo(c.dtype).eps
     if d.shape[0] == 0:
         return np.full(r.shape, 100.0 * eps)
     half = 0.5 * (hi - lo)
     t = (r - 0.5 * (lo + hi)) / half
-    slope = np.abs(_cheb_val_np(d, t)) / half
+    slope = np.abs(_cheb_val(d, t)) / half
     return np.maximum(slope, 100.0 * eps)
 
 
@@ -276,12 +276,12 @@ def roots_chebyshev_recursive_python(
 
         next_frontier = []
         for i in range(F):
-            c = _cheb_coeffs_np(s[i])
-            if _sufficient_np(c, prox_tol):
-                m = _effective_degree_np(c)
+            c = _cheb_coeffs(s[i])
+            if _sufficient(c, prox_tol):
+                m = _effective_degree(c)
                 if m >= 1:
-                    r = _roots_from_proxy_np(c, m, los[i], his[i])
-                    slope = _slopes_np(c, los[i], his[i], r)
+                    r = _roots_from_proxy(c, m, los[i], his[i])
+                    slope = _slopes(c, los[i], his[i], r)
                     roots.extend(zip(r, slope))
             else:
                 lo = los[i]
