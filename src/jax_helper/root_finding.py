@@ -116,7 +116,8 @@ def bisection(
 
     a, b, fa, fb, done, i = lax.while_loop(cond, body, (a, b, fa, fb, done0, 0))
     root = 0.5 * (a + b)
-    return jnp.where(b - a <= xtol, root, jnp.nan)
+    ok = (b - a <= xtol) & ~jnp.isnan(fa) & ~jnp.isnan(fb)
+    return jnp.where(ok, root, jnp.nan)
 
 
 def newton(
@@ -181,7 +182,7 @@ def newton(
 
     fx0 = f(x0, *args)
     if ftol is None:
-        ftol = 100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps
+        ftol = float(100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps)
     x = jnp.broadcast_to(x0, jnp.shape(fx0))
     dx = jnp.full_like(x, jnp.inf)
 
@@ -197,13 +198,13 @@ def newton(
         d = df(x, *args)
         step = jnp.where(d == 0, 0.0, fx / d)
         x = x - step
-        dx = jnp.where(d == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))
+        dx = jnp.where(d == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))  # pyright: ignore[reportArgumentType]
         return x, f(x, *args), dx, i + 1
 
     x, fx, dx, i = lax.while_loop(cond, body, (x, fx0, dx, 0))
     converged = jnp.abs(fx) <= ftol
     if xtol is not None:
-        converged = converged | (dx <= xtol)
+        converged = converged | (dx <= xtol)  # pyright: ignore[reportOperatorIssue]
     return jnp.where(converged, x, jnp.nan)
 
 
@@ -270,7 +271,7 @@ def steffensen(
 
     fx0 = f(x0, *args)
     if ftol is None:
-        ftol = 100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps
+        ftol = float(100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps)
     x = jnp.broadcast_to(x0, jnp.shape(fx0))
     dx = jnp.full_like(x, jnp.inf)
 
@@ -286,13 +287,13 @@ def steffensen(
         denom = f(x + fx / slope, *args) - fx
         step = jnp.where(denom == 0, 0.0, fx * fx / (slope * denom))
         x = x - step
-        dx = jnp.where(denom == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))
+        dx = jnp.where(denom == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))  # pyright: ignore[reportArgumentType]
         return x, f(x, *args), dx, i + 1
 
     x, fx, dx, i = lax.while_loop(cond, body, (x, fx0, dx, 0))
     converged = jnp.abs(fx) <= ftol
     if xtol is not None:
-        converged = converged | (dx <= xtol)
+        converged = converged | (dx <= xtol)  # pyright: ignore[reportOperatorIssue]
     return jnp.where(converged, x, jnp.nan)
 
 
@@ -353,7 +354,7 @@ def secant(
     f0 = f(x0, *args)
     f1 = f(x1, *args)
     if ftol is None:
-        ftol = 100.0 * jnp.finfo(jnp.asarray(f0).dtype).eps
+        ftol = float(100.0 * jnp.finfo(jnp.asarray(f0).dtype).eps)
     shape = jnp.shape(f0)
     x0 = jnp.broadcast_to(x0, shape)
     x1 = jnp.broadcast_to(x1, shape)
@@ -370,14 +371,14 @@ def secant(
         f2 = f(x2, *args)
         converged = jnp.isnan(f1) | (jnp.abs(f1) <= ftol)
         if xtol is not None:
-            converged = converged | (jnp.abs(x2 - x1) <= xtol)
+            converged = converged | (jnp.abs(x2 - x1) <= xtol)  # pyright: ignore[reportOperatorIssue]
         done = done | converged
         return x1, x2, f1, f2, done, i + 1
 
     x0, x1, f0, f1, done, i = lax.while_loop(cond, body, (x0, x1, f0, f1, done0, 0))
     converged = jnp.abs(f1) <= ftol
     if xtol is not None:
-        converged = converged | (jnp.abs(x1 - x0) <= xtol)
+        converged = converged | (jnp.abs(x1 - x0) <= xtol)  # pyright: ignore[reportOperatorIssue]
     return jnp.where(converged, x1, jnp.nan)
 
 
@@ -484,9 +485,9 @@ def brent(
 
         dpre = jnp.where(pre == cur, 0.0, (fpre - fcur) / (pre - cur))
         dblk = jnp.where(blk == cur, 0.0, (fblk - fcur) / (blk - cur))
-        stry_quad = -fcur * (fblk * dblk - fpre * dpre) / (dblk * dpre * (fblk - fpre))
+        stry_quad = -fcur * (fblk * dblk - fpre * dpre) / (dblk * dpre * (fblk - fpre))  # pyright: ignore[reportOperatorIssue, reportArgumentType]
         stry_secant = jnp.where(fcur == fpre, 0.0, -fcur * (cur - pre) / (fcur - fpre))
-        stry = jnp.where(is_secant, stry_secant, stry_quad)
+        stry = jnp.where(is_secant, stry_secant, stry_quad)  # pyright: ignore[reportCallIssue, reportArgumentType]
 
         good_step = 2 * jnp.abs(stry) < jnp.minimum(
             jnp.abs(spre), 3 * jnp.abs(sbis) - delta
@@ -512,7 +513,7 @@ def brent(
     pre, cur, blk, fpre, fcur, fblk, spre, scur, done, i = lax.while_loop(
         cond, body, init
     )
-    converged = (fcur == 0.0) | (jnp.abs(blk - cur) < xtol)
+    converged = ~jnp.isnan(fcur) & ((fcur == 0.0) | (jnp.abs(blk - cur) < xtol))
     return jnp.where(converged, cur, jnp.nan)
 
 

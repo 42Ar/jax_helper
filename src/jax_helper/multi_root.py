@@ -300,7 +300,7 @@ def roots_chebyshev_recursive_python(
         return np.asarray(f_vmapped(np.asarray([x]), *a))[0]
 
     def df_scalar(x: Any, *a: Any) -> Any:
-        return np.asarray(df(np.asarray([x]), *a))[0]
+        return np.asarray(df(np.asarray([x]), *a))[0]  # pyright: ignore[reportOptionalCall]
 
     polished = []
     if polish == "newton":
@@ -328,7 +328,7 @@ def roots_chebyshev_recursive_python(
 
     roots_arr = np.asarray(polished, dtype=dtype)
     valid = ~np.isnan(roots_arr)
-    return MultiRootResult(roots_arr, valid, np.int32(valid.sum()))
+    return MultiRootResult(roots_arr, valid, jnp.asarray(np.int32(valid.sum())))
 
 
 def roots_scan(
@@ -411,7 +411,7 @@ def roots_scan(
     roots_sub = jnp.where(change, solved, jnp.where(left_zero, xs[:-1], jnp.nan))
     right_root = jnp.where(right_zero, xs[-1], jnp.nan)
 
-    roots = jnp.concatenate([roots_sub, right_root[None]])        # (n+1,)
+    roots = jnp.concatenate([roots_sub, jnp.reshape(right_root, (1,))])        # (n+1,)  # pyright: ignore[reportArgumentType]
     roots = jnp.sort(roots)
 
     # Merge near-duplicates (roots found from adjacent brackets).
