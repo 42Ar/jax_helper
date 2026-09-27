@@ -11,7 +11,7 @@ Both return ``MultiRootResult``.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import equinox as eqx
 import jax
@@ -145,11 +145,11 @@ def roots_chebyshev_recursive_python(
     a: Any,
     b: Any,
     args: Tuple[Any, ...] = (),
-    df: Callable[..., Any] = None,
+    df: Optional[Callable[..., Any]] = None,
     n: int = 8,
     prox_tol: float = 1e-6,
-    ftol: float = None,
-    xtol: float = None,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     depth: int = 40,
     maxiter: int = 8,
     polish: str = "steffensen",

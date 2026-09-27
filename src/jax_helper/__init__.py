@@ -1,4 +1,16 @@
-"""vmappable and jittable scalar root-finding routines for JAX."""
+"""Root-finding routines for JAX.
+
+Provides:
+
+* **Scalar solvers** (jit/vmap-friendly): :func:`bisection`, :func:`brent`,
+  :func:`newton`, :func:`secant`, :func:`steffensen`.
+* **Pure-Python eager solvers**: :func:`newton_python`, :func:`steffensen_python`,
+  :func:`steffensen_python_vmapped`.
+* **Multi-root finders**: :func:`roots_chebyshev_recursive_python`,
+  :func:`roots_scan`.
+
+All scalar solvers return ``NaN`` when they fail to converge.
+"""
 
 from .multi_root import (
     MultiRootResult,

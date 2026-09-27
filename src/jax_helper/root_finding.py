@@ -24,7 +24,7 @@ See the test suite for an example.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -124,8 +124,8 @@ def newton(
     df: Callable[..., Any],
     x0: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = None,
-    xtol: float = None,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     maxiter: int = 50,
 ) -> Any:
     """Find a root of a scalar function via the Newton-Raphson method.
@@ -211,8 +211,8 @@ def steffensen(
     f: Callable[..., Any],
     x0: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = None,
-    xtol: float = None,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     maxiter: int = 50,
     slope: float = 1.0,
 ) -> Any:
@@ -301,8 +301,8 @@ def secant(
     x0: Any,
     x1: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = None,
-    xtol: float = None,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     maxiter: int = 50,
 ) -> Any:
     """Find a root of a scalar function via the secant method.
@@ -521,8 +521,8 @@ def newton_python(
     df: Callable[..., Any],
     x0: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = None,
-    xtol: float = None,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     maxiter: int = 50,
 ) -> Any:
     """Pure-Python (eager) Newton-Raphson method for scalar ``f``.
@@ -556,8 +556,8 @@ def steffensen_python(
     f: Callable[..., Any],
     x0: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = None,
-    xtol: float = None,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     maxiter: int = 50,
     slope: float = 1.0,
 ) -> Any:
@@ -593,10 +593,10 @@ def steffensen_python_vmapped(
     f_vmapped: Callable[..., Any],
     x0: Any,
     args: Tuple[Any, ...] = (),
-    ftol: float = None,
-    xtol: float = None,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     maxiter: int = 50,
-    slope: Any = 1.0,
+    slope: Union[float, np.ndarray] = 1.0,
 ) -> np.ndarray:
     """Pure-Python (eager) Steffensen's method, vectorised over many starts.
 
