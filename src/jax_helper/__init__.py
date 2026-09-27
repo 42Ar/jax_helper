@@ -2,8 +2,6 @@
 
 from .multi_root import (
     MultiRootResult,
-    roots_chebyshev,
-    roots_chebyshev_recursive,
     roots_chebyshev_recursive_python,
     roots_scan,
 )
@@ -22,8 +20,6 @@ __all__ = [
     "MultiRootResult",
     "bisection",
     "brent",
-    "roots_chebyshev",
-    "roots_chebyshev_recursive",
     "roots_chebyshev_recursive_python",
     "roots_scan",
     "newton",
