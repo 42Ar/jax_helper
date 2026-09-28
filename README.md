@@ -119,18 +119,14 @@ split into their own executions, so one odd shape costs an extra dispatch
 rather than failing everything queued alongside it.
 
 **Concurrent calls are coalesced.** The worker keeps the current batch open
-while callers keep arriving and dispatches it once the event loop has settled,
-so a burst of `await`s in one `asyncio.gather` runs as a single vectorised
-execution. `coalescing="quiescent"` (the default) waits until every
-currently-runnable coroutine has had a turn and none enqueued more — even a
-trickle arriving one call per turn is captured by one batch; 
-`coalescing="opportunistic"` yields once and runs whatever is queued, so a
-slow trickle is split into several batches. With `linger=0.02` the worker
-instead keeps the batch open for up to 20 ms — enough to also capture callers
-that are still inside `await asyncio.sleep(...)` or blocked on I/O — at the
-cost of that bounded delay for every caller in the batch. Without a `linger`,
-a lone caller runs with no added latency, and no batch ever exceeds
-`max_batch_size`.
+until every coroutine still computing has reached its `submit` and parked
+awaiting a result from the pool, then dispatches — so a burst of `await`s in
+one `asyncio.gather` runs as a single vectorised execution, and even a trickle
+arriving one call per event-loop turn is captured by one batch. A caller still
+doing synchronous work before submitting is waited for rather than missed. The
+batch executes on a dedicated worker thread, so the event loop is never blocked
+by the vectorised run itself. A lone caller runs with no added latency, and no
+batch ever exceeds `max_batch_size`.
 
 Arguments and leaves inside a short batch are zero-padded up to the next
 power of two (never more than `max_batch_size`), then trimmed back to the real
@@ -188,11 +184,12 @@ silently.
 - **Everything is traced.** Values arrive as JAX tracers, so you cannot branch
   on them in Python. Use `jax.lax.cond` or similar, or capture the constant
   lexically in a closure factory if you need real Python control flow.
-- **Batching is opportunistic, not a guarantee.** By default a lone caller
-  runs with no added latency, and a batch never waits past the point where the
-  event loop has settled; callers that arrive later simply go in the next
-  batch. Opt in to a bounded wait with `linger=...` if you need late callers
-  (sleeping or I/O-bound) in the same batch.
+- **Batching is opportunistic, not a guarantee.** A lone caller runs with no
+  added latency, and a batch never waits past the point where every coroutine
+  still computing has parked on the pool; callers that arrive later — or that
+  have not yet reached their `submit` — simply go in the next batch. A batch
+  executes on a worker thread and completes whatever has been collected, even
+  if the loop is asked to close while it is running.
 
 ## Install
 

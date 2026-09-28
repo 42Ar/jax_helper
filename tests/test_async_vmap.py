@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -47,8 +48,7 @@ async def _staged_submit(pool, index):
     """Submit ``index`` after ``index`` event-loop turns, one call per turn.
 
     The callers reach the pool on successive turns (one arrival per turn, no
-    quiet gap), which is exactly the schedule where quiescent collecting and
-    opportunistic collecting differ.
+    quiet gap).
     """
     for _ in range(index):
         await asyncio.sleep(0)
@@ -56,11 +56,12 @@ async def _staged_submit(pool, index):
 
 
 @pytest.mark.asyncio
-async def test_quiescent_coalesces_calls_across_turns():
-    """By default the worker keeps collecting until no caller is runnable.
+async def test_parked_coalesces_calls_across_turns():
+    """The worker keeps collecting until every caller has parked.
 
     Callers that reach the pool on successive turns are all captured by the
-    one batch: the worker only dispatches once a full turn adds nothing.
+    one batch: nobody is considered settled until the last caller has
+    submitted and parked on a pool future.
     """
     sizes = []
 
@@ -78,31 +79,8 @@ async def test_quiescent_coalesces_calls_across_turns():
 
 
 @pytest.mark.asyncio
-async def test_opportunistic_coalescing_splits_across_turns():
-    """``coalescing="opportunistic"`` dispatches after one turn.
-
-    Callers spread over successive turns do not wait for each other: the
-    worker takes whatever is queued after a single turn and executes, so the
-    trickle runs as several smaller batches.
-    """
-    sizes = []
-
-    def execute(requests):
-        sizes.append(len(requests))
-        return [request[0] for request in requests]
-
-    pool = _pool(execute, max_batch_size=8, coalescing="opportunistic")
-    results = await asyncio.gather(
-        *[_staged_submit(pool, i) for i in range(8)]
-    )
-
-    assert results == list(range(8))
-    assert sizes == [2, 2, 2, 2]
-
-
-@pytest.mark.asyncio
-async def test_max_batch_size_bounds_quiescent_collecting():
-    """Quiescent collecting never grows a batch past ``max_batch_size``."""
+async def test_parked_collecting_bounds_batch_size():
+    """Parked collecting never grows a batch past ``max_batch_size``."""
     sizes = []
 
     def execute(requests):
@@ -117,6 +95,61 @@ async def test_max_batch_size_bounds_quiescent_collecting():
     assert results == list(range(8))
     assert max(sizes) <= 4
     assert sum(sizes) == 8
+
+
+@pytest.mark.asyncio
+async def test_parked_waits_for_a_caller_still_computing():
+    """A caller doing synchronous work before submitting is waited for.
+
+    A caller that is still computing is *not* parked on the pool, so the
+    batch is not dispatched until the last of them has submitted and parked.
+    This is the case where a settle-after-one-turn rule would have split the
+    burst into several small executions.
+    """
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8)
+
+    async def slow(i):
+        for _ in range(4_000_000):
+            pass
+        return await pool.submit(i)
+
+    results = await asyncio.gather(*[slow(i) for i in range(8)])
+
+    assert results == list(range(8))
+    assert sizes == [8]
+
+
+@pytest.mark.asyncio
+async def test_background_task_does_not_starve_the_batch():
+    """A task parked on non-pool work cannot stall a batch forever.
+
+    The parked rule falls back to a couple of silent turns, so a background
+    coroutine idling on its own await never blocks a lone caller.
+    """
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8)
+
+    async def background():
+        await asyncio.Event().wait()  # parked on a non-pool future, forever
+
+    bg = asyncio.create_task(background())
+    try:
+        assert await asyncio.wait_for(pool.submit("x"), timeout=2) == "x"
+    finally:
+        bg.cancel()
+
+    assert sizes == [1]
 
 
 @pytest.mark.asyncio
@@ -136,83 +169,54 @@ async def test_batch_never_exceeds_max_batch_size():
 
 
 @pytest.mark.asyncio
-async def test_linger_captures_timer_delayed_callers():
-    sizes = []
+async def test_execution_runs_on_a_worker_thread():
+    """Batches execute off the event-loop thread, on a dedicated worker."""
+    thread_ids = []
 
     def execute(requests):
-        sizes.append(len(requests))
+        thread_ids.append(threading.get_ident())
         return [request[0] for request in requests]
 
-    pool = _pool(execute, max_batch_size=8, linger=0.05)
-
-    async def delayed():
-        await asyncio.sleep(0.02)
-        return await pool.submit("delayed")
-
-    results = await asyncio.gather(pool.submit("first"), delayed())
-
-    assert sorted(results) == ["delayed", "first"]
-    assert sizes == [2]
-
-
-@pytest.mark.asyncio
-async def test_linger_zero_leaves_quiescent_default():
-    sizes = []
-
-    def execute(requests):
-        sizes.append(len(requests))
-        return [request[0] for request in requests]
-
-    pool = _pool(execute, max_batch_size=8)
-
-    async def delayed():
-        await asyncio.sleep(0.02)
-        return await pool.submit("delayed")
-
-    results = await asyncio.gather(pool.submit("first"), delayed())
-
-    assert sorted(results) == ["delayed", "first"]
-    assert sizes == [1, 1]
-
-
-@pytest.mark.asyncio
-async def test_linger_respects_max_batch_size():
-    sizes = []
-
-    def execute(requests):
-        sizes.append(len(requests))
-        return [request[0] for request in requests]
-
-    pool = _pool(execute, max_batch_size=2, linger=0.05)
-
-    async def delayed():
-        await asyncio.sleep(0.02)
-        return await pool.submit("d")
-
-    results = await asyncio.gather(pool.submit("a"), pool.submit("b"), delayed())
-
-    assert sorted(results) == ["a", "b", "d"]
-    assert sizes == [2, 1]
-
-
-@pytest.mark.asyncio
-async def test_linger_bounds_a_lone_callers_latency():
-    calls = []
-
-    def execute(requests):
-        calls.append(time.perf_counter())
-        return [request[0] for request in requests]
-
-    pool = _pool(execute, max_batch_size=8, linger=0.02)
-
-    start = time.perf_counter()
+    pool = _pool(execute)
     await pool.submit(1)
+    await pool.submit(2)
+
+    # One worker thread, reused, distinct from the loop thread.
+    assert len(set(thread_ids)) == 1
+    assert thread_ids[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_loop_stays_responsive_during_execution():
+    """The loop keeps scheduling tasks while a batch executes on a thread."""
+    def execute(requests):
+        time.sleep(0.05)  # simulate a long JAX run
+        return [request[0] for request in requests]
+
+    pool = _pool(execute)
+    start = time.perf_counter()
+    task = asyncio.create_task(pool.submit(1))
+    # A batch executing on the worker thread must not freeze the loop.
+    await asyncio.sleep(0.02)
     elapsed = time.perf_counter() - start
 
-    # Dispatched only once the linger has elapsed, not right away.
-    assert elapsed >= 0.015
-    assert elapsed < 0.25
-    assert len(calls) == 1
+    assert await task == 1
+    assert elapsed < 0.045, elapsed
+
+
+@pytest.mark.asyncio
+async def test_aclose_waits_for_the_in_flight_batch():
+    """Closing during an executing batch still delivers that batch's result."""
+    def execute(requests):
+        time.sleep(0.02)
+        return [request[0] for request in requests]
+
+    pool = _pool(execute)
+    task = asyncio.create_task(pool.submit(7))
+    await asyncio.sleep(0)  # let the batch open (and start executing)
+    await pool.aclose()     # must wait for the in-flight run, not drop it
+
+    assert await task == 7
 
 
 @pytest.mark.asyncio
@@ -415,24 +419,15 @@ def test_max_batch_size_must_be_positive():
         async_vmap_pool(0)
 
 
-def test_coalescing_must_be_a_known_mode():
-    with pytest.raises(ValueError, match="coalescing must be"):
+def test_coalescing_must_be_parked():
+    with pytest.raises(ValueError, match="coalescing must be 'parked'"):
         async_vmap_pool(8, coalescing="nope")
-    # Both documented modes are accepted.
-    async_vmap_pool(8, coalescing="quiescent")
-    async_vmap_pool(8, coalescing="opportunistic")
-
-
-def test_linger_must_be_non_negative():
-    with pytest.raises(ValueError, match="linger must be at least 0"):
-        async_vmap_pool(8, linger=-0.5)
-
-
-def test_linger_must_be_a_number():
-    with pytest.raises(TypeError, match="linger must be a number"):
-        async_vmap_pool(8, linger="soon")  # type: ignore[arg-type]
-    async_vmap_pool(8, linger=0)
-    async_vmap_pool(8, linger=0.01)
+    with pytest.raises(ValueError, match="coalescing must be 'parked'"):
+        async_vmap_pool(8, coalescing="quiescent")
+    with pytest.raises(ValueError, match="coalescing must be 'parked'"):
+        async_vmap_pool(8, coalescing="opportunistic")
+    async_vmap_pool(8, coalescing="parked")
+    async_vmap_pool(8)
 
 
 @pytest.mark.asyncio

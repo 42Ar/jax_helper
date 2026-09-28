@@ -11,15 +11,19 @@ calls: only the *structure* and *leaf shapes* decide which requests may share
 a batch, never the values themselves. Two requests batch together exactly when
 stacking them is possible, so free-varying arguments cost nothing.
 
-Batching is *coalescing*: the worker keeps the current batch open while
-concurrent callers keep arriving and dispatches it once the event loop has
-settled. ``coalescing="quiescent"`` (the default) waits until every
-currently-runnable coroutine has had a turn and none enqueued more, so the
-whole burst runs as one batch; ``coalescing="opportunistic"`` yields once and
-dispatches whatever is queued. Passing ``linger`` waits up to that many
-seconds for callers that are still sleeping or blocked on I/O. Either way a
-batch never grows past ``max_batch_size``; with no ``linger`` a lone caller
-runs with no added latency, and with a ``linger`` it waits at most that long.
+Batching is *coalescing*: the worker keeps the current batch open and
+dispatches it once every live task is parked awaiting a result from this pool
+and nothing new is queued -- the whole program is standing on the pool, so no
+more requests can arrive until one of the batches executes. A caller that is
+still computing (or still on an earlier await) is waited for, so a burst of
+concurrent calls -- even ones that reach the ``submit`` at different moments
+-- runs as one execution. ``coalescing="parked"`` is the only mode. A batch
+never grows past ``max_batch_size``, and a lone caller runs with no added
+latency: with no one else active, the first quiet turn dispatches it.
+
+Batches execute on a dedicated worker thread, so the event loop is never
+frozen while NumPy or JAX compute runs; callers that become ready mid-batch
+submit straight into the next batch's queue.
 
 The pooling machinery is plain asyncio and knows nothing about JAX: it takes
 injected ``key`` and ``execute`` callables, which is what makes it testable on
@@ -34,6 +38,7 @@ import functools
 import sys
 import weakref
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import (
     Any,
     Callable,
@@ -43,6 +48,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
     cast,
 )
 
@@ -71,6 +77,32 @@ def _log(label: Optional[str], message: str) -> None:
     )
 
 
+class _Close:
+    """Sentinel type slipped onto the queue by :meth:`_Pool.aclose` to stop
+    the worker after any in-flight batch has finished. Never a real request:
+    every submit wraps its arguments in a tuple, so a sentinel is
+    unambiguous."""
+
+    __slots__ = ()
+
+
+#: The pool's close sentinel, also used to type the queue items.
+_CLOSE = _Close()
+
+#: Item on the pool queue: either a request, or the close sentinel.
+_QueueItem = Union[_Request, _Close]
+
+#: Number of consecutive turns with nothing queued and something still not
+#: parked on the pool before the worker dispatches anyway. A safety valve so a
+#: task parked on non-pool work (a listener, an I/O loop, an unrelated sleep)
+#: can never starve a batch waiting for the "everyone is parked" condition.
+_SETTLE_TURNS = 2
+
+#: The pool never runs more than one batch at a time, so a single worker
+#: thread is all it can ever use.
+_MAX_WORKERS = 1
+
+
 class _Pool:
     """Coalesces concurrent submissions into calls to ``execute``.
 
@@ -87,8 +119,7 @@ class _Pool:
         loop: asyncio.AbstractEventLoop,
         debug: bool = False,
         label: str = "",
-        coalescing: str = "quiescent",
-        linger: float = 0.0,
+        coalescing: str = "parked",
     ) -> None:
         self._execute = execute
         self._key = key
@@ -97,13 +128,15 @@ class _Pool:
         self._debug = debug
         self._label = label
         self._coalescing = coalescing
-        self._linger = linger
-        self._queue: "asyncio.Queue[_Request]" = asyncio.Queue()
+        self._queue: "asyncio.Queue[_QueueItem]" = asyncio.Queue()
         self._task: Optional["asyncio.Task[None]"] = None
+        self._threadpool: Optional[ThreadPoolExecutor] = None
         self._pending: "set[asyncio.Future[Any]]" = set()
+        self._closing = False
 
     def _ensure_worker(self) -> None:
         if self._task is None or self._task.done():
+            self._closing = False
             self._task = self._loop.create_task(self._run())
             self._task.add_done_callback(self._on_worker_done)
 
@@ -120,69 +153,72 @@ class _Pool:
 
     async def _run(self) -> None:
         while True:
-            request, future = await self._queue.get()
+            item = await self._queue.get()
+            if isinstance(item, _Close):
+                break
+            request, future = item
             batch: List[_Request] = [(request, future)]
-            if self._linger > 0.0:
-                await self._collect_with_linger(batch)
-            elif self._coalescing == "quiescent":
-                await self._collect_until_settled(batch)
-            else:
-                await self._collect_immediately(batch)
-            self._dispatch_grouped(batch)
+            if not self._closing:
+                await self._collect_until_all_parked(batch)
+            await self._dispatch_grouped(batch)
 
-    async def _collect_with_linger(self, batch: List[_Request]) -> None:
-        """Wait up to ``linger`` seconds for more callers, then dispatch.
+    async def _collect_until_all_parked(self, batch: List[_Request]) -> None:
+        """Grow the batch while any caller could still submit.
 
-        The time-based mode: the batch stays open until it is full or until
-        ``linger`` seconds have passed since it opened, by which point even a
-        caller still inside ``asyncio.sleep`` or blocked on I/O has had time
-        to arrive. A lone caller therefore waits the full ``linger``.
+        Waits until every live task is parked awaiting one of this pool's
+        futures and nothing new is queued: at that point no request can reach
+        the pool until a batch executes, so the batch is complete. A caller
+        still computing is *not* parked, so it is waited for rather than
+        missed -- no turn-counting, no fixed linger.
+
+        Two turn-based safety valves bound the wait: the batch is full, or the
+        queue has been empty for a couple of turns while something still is
+        not parked on the pool. The latter keeps a background task that parks
+        on unrelated work (a listener, an I/O loop) from starving the batch.
         """
-        deadline = self._loop.time() + self._linger
-        while len(batch) < self._max_batch_size:
-            remaining = deadline - self._loop.time()
-            if remaining <= 0.0:
-                return
-            try:
-                request, future = await asyncio.wait_for(
-                    self._queue.get(), remaining
-                )
-            except asyncio.TimeoutError:
-                return
-            batch.append((request, future))
-
-    async def _collect_until_settled(self, batch: List[_Request]) -> None:
-        """Grow the batch until no other coroutine is ready to enqueue.
-
-        Each turn runs every currently-runnable coroutine, then the batch
-        takes whatever arrived. The batch is only dispatched once a full turn
-        adds nothing -- the event loop has settled -- or it is full. A lone
-        caller is alone in the loop, so the first turn adds nothing and it
-        runs with no added latency; a burst is all captured in one batch.
-        """
-        while len(batch) < self._max_batch_size:
+        idle_turns = 0
+        while len(batch) < self._max_batch_size and not self._closing:
+            # One turn lets every currently-runnable task reach its submit.
             await asyncio.sleep(0)
             grew = False
             while len(batch) < self._max_batch_size and not self._queue.empty():
-                batch.append(self._queue.get_nowait())
+                item = self._queue.get_nowait()
+                if isinstance(item, _Close):
+                    # aclose slipped in mid-drain: leave it for the worker's
+                    # own get() so it still stops the loop, and dispatch what
+                    # we have.
+                    self._queue.put_nowait(item)
+                    break
+                batch.append(item)
                 grew = True
-            if not grew:
+            if grew:
+                idle_turns = 0
+                continue
+            if self._all_parked():
+                return
+            idle_turns += 1
+            if idle_turns >= _SETTLE_TURNS:
                 return
 
-    async def _collect_immediately(self, batch: List[_Request]) -> None:
-        """Yield once for ready callers, drain once, and execute right away.
+    def _all_parked(self) -> bool:
+        """True when no live task can enqueue without a batch executing first.
 
-        The opportunistic mode: whatever is queued after a single turn is the
-        batch, and anything that enqueues a turn later starts its own batch.
+        A task is parked on this pool when the future it awaits is one of the
+        futures handed out by :meth:`submit`. ``asyncio.Task._fut_waiter`` is
+        a private field but stable across CPython versions; a task awaiting a
+        ``gather`` of pool calls is represented transitively by its children
+        (the per-item tasks ``gather`` creates), which wait on pool futures
+        directly.
         """
-        # Yield once so other ready coroutines can enqueue, then take
-        # whatever is already queued. Deliberately no linger: waiting for
-        # more would add latency to every caller.
-        await asyncio.sleep(0)
-        while len(batch) < self._max_batch_size and not self._queue.empty():
-            batch.append(self._queue.get_nowait())
+        for task in asyncio.all_tasks(self._loop):
+            if task is self._task or task.done():
+                continue
+            waiter = getattr(task, "_fut_waiter", None)
+            if waiter not in self._pending:
+                return False
+        return True
 
-    def _dispatch_grouped(self, batch: List[_Request]) -> None:
+    async def _dispatch_grouped(self, batch: List[_Request]) -> None:
         """Split the batch into compatible groups and execute each.
 
         Grouping is what keeps batching working when arguments vary: requests
@@ -201,7 +237,7 @@ class _Pool:
             return
 
         for group in groups.values():
-            self._dispatch(group)
+            await self._dispatch(group)
 
     def _report(self, group: List[_Request]) -> None:
         """Log the start of one execution, ahead of running the executor.
@@ -220,10 +256,19 @@ class _Pool:
             return
         _log(self._label, f"{verb} {len(group)} request(s)")
 
-    def _dispatch(self, group: List[_Request]) -> None:
+    async def _dispatch(self, group: List[_Request]) -> None:
         self._report(group)
         try:
-            results = self._execute([request for request, _ in group])
+            # Run the batch on a dedicated thread so the event loop is not
+            # frozen by NumPy/JAX compute; the GIL-releasing C work there lets
+            # the loop keep servicing callers in parallel.
+            if self._threadpool is None:
+                self._threadpool = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
+            results = await self._loop.run_in_executor(
+                self._threadpool,
+                self._execute,
+                [request for request, _ in group],
+            )
             if len(results) != len(group):
                 raise ValueError(
                     f"executor returned {len(results)} results "
@@ -232,7 +277,8 @@ class _Pool:
         except Exception as exc:
             # Every caller in the group gets the failure. Not re-raised: the
             # group has reported itself, and the worker stays alive to serve
-            # the next batch.
+            # the next batch. ``CancelledError`` is a ``BaseException`` and
+            # propagates to ``_on_worker_done``, which streams it to waiters.
             self._report_done(group)
             self._settle(group, exc)
             return
@@ -269,10 +315,16 @@ class _Pool:
                 future.set_exception(failure)
 
     async def aclose(self) -> None:
-        """Cancel the worker and strand no one."""
+        """Stop the worker after any in-flight batch, stranding no one.
+
+        The sentinel ensures a batch already executing on the worker thread is
+        finished (and its results delivered) before the worker exits, so a
+        close never drops a result.
+        """
         if self._task is None:
             return
-        self._task.cancel()
+        self._closing = True
+        await self._queue.put(_CLOSE)
         try:
             await self._task
         except asyncio.CancelledError:
@@ -281,6 +333,8 @@ class _Pool:
         for future in list(self._pending):
             if not future.done():
                 future.cancel()
+        if self._threadpool is not None:
+            self._threadpool.shutdown(wait=True)
 
 
 def _request_key(request: Tuple[Any, ...]) -> Hashable:
@@ -393,8 +447,7 @@ def _build_executor(
 def async_vmap_pool(
     max_batch_size: int,
     debug: bool = False,
-    coalescing: str = "quiescent",
-    linger: float = 0.0,
+    coalescing: str = "parked",
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
 
@@ -420,19 +473,14 @@ def async_vmap_pool(
             function and the number of requests in that batch, plus a line
             whenever a new batch size is compiled. Useful for confirming that
             concurrent calls really are coalescing and that sizes are shared.
-        coalescing: How the worker decides the batch is complete when
-            ``linger`` is 0. ``"quiescent"`` (the default) waits until every
-            currently-runnable coroutine has had a turn and none enqueued
-            more, so all batched callers are captured by one execution;
-            ``"opportunistic"`` yields once and dispatches whatever is
-            queued, so callers that arrive a turn later run as their own
-            batch. A lone caller runs with no added latency under both.
-        linger: If greater than 0, the number of seconds a batch stays open
-            for more callers before it is dispatched, in addition to the
-            ``coalescing`` rule. This gives callers that are still sleeping
-            or blocked on I/O time to arrive and join the batch. A lone
-            caller therefore waits up to ``linger`` before its batch runs.
-            Takes precedence over ``coalescing``.
+        coalescing: How the worker decides a batch is complete. ``"parked"``
+            (the default, and the only mode) waits until every live task is
+            parked awaiting a result from this pool and nothing new is queued,
+            so a burst of concurrent calls -- even ones reaching the decorator
+            at slightly different moments -- runs as one ``vmap`` execution
+            rather than one per arrival. Batches execute on a dedicated worker
+            thread, so the loop is never blocked by the compute. A lone caller
+            runs with no added latency.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -442,11 +490,9 @@ def async_vmap_pool(
     several loops (or from several tests) without them interfering.
 
     Raises:
-        TypeError: If ``max_batch_size`` is not an ``int``, or ``linger`` is
-            not a number.
-        ValueError: If ``max_batch_size`` is less than 1, ``linger`` is
-            negative, or ``coalescing`` is not ``"quiescent"`` or
-            ``"opportunistic"``.
+        TypeError: If ``max_batch_size`` is not an ``int``.
+        ValueError: If ``max_batch_size`` is less than 1, or ``coalescing``
+            is not ``"parked"``.
     """
     if not isinstance(max_batch_size, int):
         raise TypeError(
@@ -456,20 +502,10 @@ def async_vmap_pool(
         raise ValueError(
             f"max_batch_size must be at least 1, got {max_batch_size}"
         )
-    if coalescing not in ("quiescent", "opportunistic"):
+    if coalescing != "parked":
         raise ValueError(
-            "coalescing must be 'quiescent' or 'opportunistic', "
-            f"got {coalescing!r}"
+            f"coalescing must be 'parked', got {coalescing!r}"
         )
-    if isinstance(linger, bool) or not isinstance(linger, (int, float)):
-        raise TypeError(
-            f"linger must be a number, got {type(linger).__name__}"
-        )
-    if linger < 0:
-        raise ValueError(
-            f"linger must be at least 0, got {linger}"
-        )
-    linger_float = float(linger)
 
     def decorator(scalar_fn: Callable[..., Any]) -> Callable[..., Any]:
         execute = _build_executor(
@@ -502,7 +538,6 @@ def async_vmap_pool(
                     debug=debug,
                     label=getattr(scalar_fn, "__name__", ""),
                     coalescing=coalescing,
-                    linger=linger_float,
                 )
                 pools[loop] = pool
             return await pool.submit(*items)
