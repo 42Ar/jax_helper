@@ -57,6 +57,15 @@ Key = Callable[[Tuple[Any, ...]], Hashable]
 Execute = Callable[[List[Tuple[Any, ...]]], Sequence[Any]]
 
 
+def _log(label: Optional[str], message: str) -> None:
+    """Print one debug line for the pool, timestamped, to stderr."""
+    stamp = datetime.datetime.now().isoformat(sep=" ", timespec="milliseconds")
+    print(
+        f"[{stamp}] [async_vmap_pool] {label or 'function'}: {message}",
+        file=sys.stderr,
+    )
+
+
 class _Pool:
     """Coalesces concurrent submissions into calls to ``execute``.
 
@@ -150,12 +159,7 @@ class _Pool:
     def _log(self, group: List[_Request], verb: str) -> None:
         if not self._debug:
             return
-        stamp = datetime.datetime.now().isoformat(sep=" ", timespec="milliseconds")
-        print(
-            f"[{stamp}] [async_vmap_pool] {self._label or 'function'}: "
-            f"{verb} {len(group)} request(s)",
-            file=sys.stderr,
-        )
+        _log(self._label, f"{verb} {len(group)} request(s)")
 
     def _dispatch(self, group: List[_Request]) -> None:
         self._report(group)
@@ -242,7 +246,8 @@ def _request_key(request: Tuple[Any, ...]) -> Hashable:
 def _build_executor(
     scalar_fn: Callable[..., Any],
     max_batch_size: int,
-    pad_to_max: bool,
+    debug: bool = False,
+    label: Optional[str] = None,
 ) -> Execute:
     """Compile ``scalar_fn`` under ``jit(vmap(...))`` and return an executor.
 
@@ -256,13 +261,16 @@ def _build_executor(
     object serves every arity, and it recompiles per distinct structure by
     itself.
 
-    With ``pad_to_max``, short batches are zero-padded along axis 0 of every
-    leaf, so the vectorised function always sees a static leading dimension and
-    is not recompiled for each distinct batch size. The glue -- stacking,
-    padding, and trimming back to the real batch size -- runs on NumPy arrays,
-    where varying sizes are free and never touch the compiler; whoever pads
-    streams in a mix of batch sizes, only the vectorised function itself is
-    ever compiled, and once.
+    Short batches are zero-padded along axis 0 of every leaf up to the next
+    power of two (no more than ``max_batch_size``), so padding never exceeds a
+    factor of two and the vectorised function only ever sees a small, bounded
+    set of leading dimensions: one per power of two from 2 up to
+    ``max_batch_size``. JAX's ``jit`` cache memoises the result, so each
+    distinct rounded size is compiled once and reused forever after -- a
+    workload with wildly varying batch sizes pays at most
+    ``log2(max_batch_size) + 1`` compilations. The glue -- stacking, padding,
+    and trimming back to the real batch size -- runs on NumPy arrays, where
+    varying sizes are free and never touch the compiler.
     """
     import jax
 
@@ -276,33 +284,43 @@ def _build_executor(
         width = [(0, size - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
         return np.pad(arr, width)
 
+    compiled_sizes: set = set()
+
     def execute(requests: List[Tuple[Any, ...]]) -> Sequence[Any]:
         n = len(requests)
+        # Round the real batch size up to the next power of two (capped at
+        # max_batch_size), so a batch of 100 runs on 128 and one of 1000 on
+        # 1000: padding overhead ≤ 2x, and each distinct rounded size is a
+        # single compiled entry reused by every batch that rounds to it.
+        size = min(1 << (n - 1).bit_length(), max_batch_size)
         # The stack, pad and trim are the batch *glue*, and it deliberately
         # runs on NumPy rather than jnp. The vectorised function below is the
         # only thing that should ever reach the compiler; sizing it with every
         # call's real batch size would make it recompile per distinct `n`.
         #
         # Originally the glue used jnp.stack / jnp.pad / result[:n]. With
-        # pad_to_max the fused function's signature is stable (its leading
-        # dimension is always max_batch_size), but the glue runs on the real
-        # `n`, so its ops kept changing shape: _pad compiled once per distinct
-        # n, jnp.stack compiled per split of the drain, and slicing a device
-        # array with a runtime bound n created a fresh jit(dynamic_slice) on
-        # every dispatch - even with an identical signature - flooding the
-        # compile logs whenever batch sizes varied. ~50 XLA compilations per
-        # burst of distinct sizes, each around half a second, versus the one
-        # compile of the fused function that actually matters.
+        # padded leading dimensions the fused function's signature is stable
+        # per rounded size, but the glue still ran on the real `n`, so its ops
+        # kept changing shape: _pad compiled once per distinct n, jnp.stack
+        # compiled per split of the drain, and slicing a device array with a
+        # runtime bound n created a fresh jit(dynamic_slice) on every dispatch
+        # - even with an identical signature - flooding the compile logs
+        # whenever batch sizes varied. That was tens of XLA compilations per
+        # burst of distinct sizes, each around half a second, instead of the
+        # handful of cached fused-function entries that matter.
         #
         # NumPy escapes all of that: np.stack / np.pad see plain host arrays,
         # and np.asarray(...)[:n] trims after the XLA result was pulled to the
         # host, so variable sizes never enter JAX dispatch.
+        if debug and size not in compiled_sizes:
+            compiled_sizes.add(size)
+            _log(label, f"compiling batch size {size} (for {n} requests)")
         stacked = jax.tree_util.tree_map(lambda *xs: np.stack(xs), *requests)
         # Leafwise, so pytree arguments, bare scalars, and mixtures of the two
         # all stack correctly: each leaf is stacked against its counterparts.
-        if pad_to_max and n < max_batch_size:
+        if size > n:
             padded = jax.tree_util.tree_map(
-                lambda arr: _padded(arr, max_batch_size), stacked
+                lambda arr: _padded(arr, size), stacked
             )
             # np.asarray blocks on the XLA result and transfers it to the
             # host; the [:n] then slices a plain NumPy array. Results are the
@@ -315,7 +333,6 @@ def _build_executor(
 
 def async_vmap_pool(
     max_batch_size: int,
-    pad_to_max: bool = True,
     debug: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
@@ -325,24 +342,23 @@ def async_vmap_pool(
     calls are batched into one ``vmap`` execution.
 
     Values in any pytree may differ freely between calls; batching groups on
-    structure and leaf shape only. Where padding applies it is applied to
-    every argument and every leaf, and the result is trimmed back to the real
-    batch size, so short batches still run against a static shape. Stacking,
-    padding and trimming all happen on NumPy arrays, so varying batch sizes
-    never cause JAX recompilations -- only the vectorised function itself is
-    compiled, and once per distinct structure and dtype. Each request resolves
-    to a NumPy array; results are pulled off the device host-side every batch,
+    structure and leaf shape only. Every batch is zero-padded along axis 0 of
+    every leaf up to the next power of two (never more than
+    ``max_batch_size``), so padding adds at most a factor of two of work and
+    the vectorised function compiles once per distinct rounded size -- never
+    per batch size. Stacking, padding and trimming all happen on NumPy arrays,
+    so variable batch sizes never reach the compiler. Each request resolves to
+    a NumPy array; results are pulled off the device host-side every batch,
     which is negligible on CPU.
 
     Args:
         max_batch_size: The maximum number of requests drained into one
-            batch, and also the padded leading dimension when ``pad_to_max``
-            is set. Each compatible group within a batch is at most this size.
-        pad_to_max: If True, pad short batches up to ``max_batch_size`` with
-            zeros so JAX does not recompile for every distinct batch size.
+            batch: each compatible group within a batch is at most this size,
+            and it caps the padded-up leading dimension.
         debug: If True, print a line to stderr for every execution, naming the
-            function and the number of requests in that batch. Useful for
-            confirming that concurrent calls really are coalescing.
+            function and the number of requests in that batch, plus a line
+            whenever a new batch size is compiled. Useful for confirming that
+            concurrent calls really are coalescing and that sizes are shared.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -365,7 +381,12 @@ def async_vmap_pool(
         )
 
     def decorator(scalar_fn: Callable[..., Any]) -> Callable[..., Any]:
-        execute = _build_executor(scalar_fn, max_batch_size, pad_to_max)
+        execute = _build_executor(
+            scalar_fn,
+            max_batch_size,
+            debug=debug,
+            label=getattr(scalar_fn, "__name__", ""),
+        )
 
         # Keyed by the running loop, so each loop gets a private pool. Weak, so
         # a finished loop's pool is collected with it.

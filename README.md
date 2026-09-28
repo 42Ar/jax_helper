@@ -118,13 +118,15 @@ exactly when stacking them is possible. Requests that cannot share a `vmap`
 split into their own executions, so one odd shape costs an extra dispatch
 rather than failing everything queued alongside it.
 
-Arguments and leaves inside a short batch are zero-padded to `max_batch_size`
-(`pad_to_max=True`, the default) so JAX does not recompile for each distinct
-batch size, then trimmed back to the real size. Because every argument is
-padded, the whole batch keeps a static leading dimension. Stacking, padding
-and trimming all run on NumPy, off the compiler, so a workload whose batch
-sizes keep changing compiles the vectorised function exactly once per
-structure and dtype.
+Arguments and leaves inside a short batch are zero-padded up to the next
+power of two (never more than `max_batch_size`), then trimmed back to the real
+size. Because every argument is padded, the whole batch keeps a leading
+dimension from a small bounded set — the powers of two from `2` up to
+`max_batch_size` — and JAX's `jit` cache reuses each compiled entry, so a batch
+of 100 and one of 128 share the same compiled code. Padding therefore never
+exceeds a factor of two, and a workload whose batch sizes keep changing
+compiles the vectorised function at most `log2(max_batch_size) + 1` times.
+Stacking, padding and trimming all run on NumPy, off the compiler.
 
 Each event loop gets its own pool, so the decorated function is usable from
 several loops concurrently without them interfering.
@@ -154,7 +156,10 @@ the size of each compatible group rather than of the whole drained batch — so
 a batch that splits because of differing shapes reports each group separately.
 The `executing` line is printed before the executor runs, so a batch that
 raises is still reported, and the `executed` line is printed whatever the
-outcome.
+outcome. The first time a rounded batch size reaches the compiler, a
+`compiling batch size N (for M requests)` line is printed too, so you can see
+which entries the `jit` cache is actually paying for; repeats reuse them
+silently.
 
 ### Limits
 
@@ -164,7 +169,8 @@ outcome.
   cannot be stacked and raise `TypeError`.
 - **Leaf shapes must agree within a batch.** Requests of different leaf shapes
   run in separate executions, each of which compiles once and is then reused.
-  `pad_to_max` stabilises the batch dimension only, not leaf dimensions.
+  Padding rounds the batch dimension up to a power of two only; leaf
+  dimensions are never changed.
 - **Everything is traced.** Values arrive as JAX tracers, so you cannot branch
   on them in Python. Use `jax.lax.cond` or similar, or capture the constant
   lexically in a closure factory if you need real Python control flow.

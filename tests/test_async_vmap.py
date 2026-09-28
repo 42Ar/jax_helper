@@ -424,18 +424,23 @@ async def test_padding_covers_every_argument_and_leaf():
     def f(x, args):
         return x * 10 + args["k"]
 
-    results = await asyncio.gather(f(1.0, {"k": 0.5}), f(2.0, {"k": 0.5}))
+    # Three requests round up to a padded batch of 4 on both arguments.
+    results = await asyncio.gather(
+        f(1.0, {"k": 0.5}),
+        f(2.0, {"k": 0.5}),
+        f(3.0, {"k": 0.5}),
+    )
 
     # Trimming back to the real batch size is what proves padding was applied
     # to both arguments and then removed.
-    assert [float(v) for v in results] == [10.5, 20.5]
+    assert [float(v) for v in results] == [10.5, 20.5, 30.5]
 
 
 @pytest.mark.asyncio
-async def test_padded_pair_form_traces_once_across_batch_sizes():
+async def test_traces_once_per_rounded_power_of_two():
     traces = []
 
-    @async_vmap_pool(8, pad_to_max=True)
+    @async_vmap_pool(8)
     def f(x, args):
         traces.append(1)
         return x * args["k"]
@@ -445,15 +450,15 @@ async def test_padded_pair_form_traces_once_across_batch_sizes():
 
     assert [float(v) for v in first] == [2, 4]
     assert [float(v) for v in second] == [0, 2, 4, 6, 8]
-    # Both batch sizes were padded to 8, so the second reused the first trace.
-    assert len(traces) == 1
+    # Batches of 2 and 5 round to the powers of two 2 and 8: one trace each.
+    assert len(traces) == 2
 
 
 @pytest.mark.asyncio
 async def test_each_leaf_shape_reuses_its_compiled_entry():
     traces = []
 
-    @async_vmap_pool(8, pad_to_max=False)
+    @async_vmap_pool(8)
     def f(x, args):
         traces.append(args["w"].shape[0])
         return x
@@ -467,12 +472,13 @@ async def test_each_leaf_shape_reuses_its_compiled_entry():
 
 
 @pytest.mark.asyncio
-async def test_pad_to_max_never_recompiles_across_batch_sizes():
-    """Varying batch sizes must not recompile the batch glue.
+async def test_batches_recompile_only_per_rounded_power_of_two():
+    """Batches must compile once per distinct rounded batch size, never more.
 
-    The stack/pad/trim helpers run on NumPy, so a second -- differently sized
-    -- batch must not spawn any new XLA compilations beyond the single compile
-    of the vectorised function itself.
+    Every batch of n requests is padded up to the next power of two (capped at
+    ``max_batch_size``), and each distinct padded size is a single compiled
+    entry. The stack/pad/trim glue runs on NumPy, so those sizes never add
+    XLA compilations of their own.
     """
     import logging
 
@@ -490,7 +496,7 @@ async def test_pad_to_max_never_recompiles_across_batch_sizes():
     handler = _Capture()
     logging.getLogger().addHandler(handler)
     try:
-        @async_vmap_pool(8, pad_to_max=True)
+        @async_vmap_pool(8)
         def f(x):
             return x * 2
 
@@ -502,6 +508,48 @@ async def test_pad_to_max_never_recompiles_across_batch_sizes():
         jax.config.update("jax_log_compiles", old)
 
     jits = [m for m in compiles if "Compiling jit(" in m]
+    # Batches of 2 and 5 round to the powers of two 2 and 8: one compile each.
+    assert len(jits) == 2
+    assert all("jit(f)" in j for j in jits)
+
+
+@pytest.mark.asyncio
+async def test_same_rounded_size_shares_one_compile():
+    """Batches of different sizes that round to the same power of two share it.
+
+    A batch of 3 and a batch of 4 both round to 4, so the second must reuse
+    the first batch's compiled entry.
+    """
+    import logging
+
+    import jax
+
+    compiles = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            compiles.append(record.getMessage())
+
+    old, old_level = getattr(jax.config, "jax_log_compiles"), logging.getLogger().level
+    jax.config.update("jax_log_compiles", True)
+    logging.getLogger().setLevel(logging.WARNING)
+    handler = _Capture()
+    logging.getLogger().addHandler(handler)
+    try:
+        @async_vmap_pool(8)
+        def f(x):
+            return x * 2
+
+        three = await asyncio.gather(f(1.0), f(2.0), f(3.0))
+        four = await asyncio.gather(*[f(float(i)) for i in range(4)])
+    finally:
+        logging.getLogger().removeHandler(handler)
+        logging.getLogger().setLevel(old_level)
+        jax.config.update("jax_log_compiles", old)
+
+    assert [float(v) for v in three] == [2.0, 4.0, 6.0]
+    assert [float(v) for v in four] == [0.0, 2.0, 4.0, 6.0]
+    jits = [m for m in compiles if "Compiling jit(" in m]
     assert len(jits) == 1
     assert "jit(f)" in jits[0]
 
@@ -511,18 +559,20 @@ async def test_padded_results_are_plain_numpy_arrays():
     """The executor hands back host NumPy arrays, not jax arrays."""
     import jax
 
-    @async_vmap_pool(8, pad_to_max=True)
+    @async_vmap_pool(8)
     def f(x):
         return x * 2
 
-    results = await asyncio.gather(f(1.0), f(2.0))
+    # Three requests round up to a padded batch of 4, exercising the padded
+    # path on a batch that cannot fill its rounded size.
+    results = await asyncio.gather(f(1.0), f(2.0), f(3.0))
 
-    assert [r.shape for r in results] == [(), ()]
+    assert [r.shape for r in results] == [(), (), ()]
     assert all(
         isinstance(r, (np.ndarray, np.generic)) and not isinstance(r, jax.Array)
         for r in results
     )
-    assert [float(r) for r in results] == [2.0, 4.0]
+    assert [float(r) for r in results] == [2.0, 4.0, 6.0]
 
 
 @pytest.mark.asyncio
@@ -727,7 +777,7 @@ async def test_debug_reports_group_size_not_drained_batch_size(capsys):
 
 @pytest.mark.asyncio
 async def test_debug_reports_the_real_count_not_the_padded_one(capsys):
-    """pad_to_max changes the compiled shape, not the number of callers."""
+    """Padding changes the compiled shape, not the number of callers."""
     def execute(requests):
         return [request[0] for request in requests]
 
@@ -736,6 +786,27 @@ async def test_debug_reports_the_real_count_not_the_padded_one(capsys):
     await pool.submit(1)
 
     assert "executing 1 request(s)" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_when_a_new_batch_size_compiles(capsys):
+    """A debug line marks the first time a rounded batch size is compiled."""
+    @async_vmap_pool(max_batch_size=8, debug=True)
+    def f(x):
+        return x * 2
+
+    one = await f(1.0)                       # batch of 1  -> size 1, compiles
+    three = await asyncio.gather(f(1.0), f(2.0), f(3.0))  # size 4, compiles
+    again = await asyncio.gather(f(1.0), f(2.0), f(3.0))  # size 4, cached
+
+    lines = capsys.readouterr().err.splitlines()
+    compiles = [l for l in lines if "compiling batch size" in l]
+    assert len(compiles) == 2
+    assert "f: compiling batch size 1 (for 1 requests)" in compiles[0]
+    assert "f: compiling batch size 4 (for 3 requests)" in compiles[1]
+    assert float(one) == 2.0
+    assert [float(v) for v in three] == [2.0, 4.0, 6.0]
+    assert [float(v) for v in again] == [2.0, 4.0, 6.0]
 
 
 @pytest.mark.asyncio
