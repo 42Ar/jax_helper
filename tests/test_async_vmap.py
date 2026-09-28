@@ -1163,8 +1163,8 @@ async def test_settle_message_names_the_time_budget(capsys):
     pool = _pool(execute, debug=True, label="pinned")
 
     async def background():
-        await asyncio.sleep(0)     # let the worker start collecting
-        time.sleep(0.002)          # block the loop past the 1 ms budget
+        await asyncio.sleep(0)       # let the worker start collecting
+        time.sleep(0.15)             # block the loop past the 100 ms budget
         await asyncio.Event().wait()  # then stay unparked, pinning the valve
 
     bg = asyncio.create_task(background())
@@ -1175,7 +1175,7 @@ async def test_settle_message_names_the_time_budget(capsys):
 
     output = capsys.readouterr().err
     assert "pinned: dispatching after" in output
-    assert "safety valve: time budget (1.0 ms)" in output
+    assert "safety valve: time budget (100.0 ms)" in output
 
 
 @pytest.mark.asyncio

@@ -125,7 +125,7 @@ _SETTLE_TURNS = 100
 #: the settle safety valve dispatches it anyway (see ``_SETTLE_TURNS``). The
 #: ``min_batch_size`` hold and the unparked-task wait together last at most
 #: this long, or ``_SETTLE_TURNS`` idle turns, whichever comes first.
-_SETTLE_TIMEOUT = 0.001
+_SETTLE_TIMEOUT = 0.1
 
 #: The pool never runs more than one batch at a time, so a single worker
 #: thread is all it can ever use.
