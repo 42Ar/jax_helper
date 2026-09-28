@@ -14,8 +14,9 @@ stacking them is possible, so free-varying arguments cost nothing.
 Batching is *coalescing*: the worker keeps the current batch open and
 dispatches it once every live task is parked awaiting a result from this pool
 and nothing new is queued -- the whole program is standing on the pool, so no
-more requests can arrive until one of the batches executes -- and, if set, the
-batch holds at least ``min_batch_size`` requests. A caller that is still
+more requests can arrive until one of the batches executes -- and
+``min_batch_size`` only floors the compiled batch size: a sub-minimum batch
+dispatches padded up to it, never held. A caller that is still
 computing (or parked on a non-pool await such as a timer, an ``Event`` or a
 lock) is waited for, so a burst of concurrent calls -- even ones that reach the
 ``submit`` at different moments -- runs as one execution. A caller suspended on
@@ -27,7 +28,9 @@ quiet turn dispatches it.
 
 With ``padding="up"`` (the default) a batch is zero-padded along axis 0 of
 every leaf to the next power of two, so one execution serves the whole batch
-at the cost of at most a factor of two of compute. With ``padding="down"`` a
+at the cost of at most a factor of two of compute -- or, below
+``min_batch_size``, of padding the batch up to the power-of-two floor. With
+``padding="down"`` a
 batch instead runs at the largest power-of-two prefix and the remainder is
 shifted to the next batch, so no request is ever padded and nothing is ever
 zero-padded up to a brand-new compiled size, at the cost of extra executions.
@@ -633,7 +636,8 @@ def _build_executor(
     power of two (no more than ``max_batch_size``) -- and never below the next
     power of two of ``min_batch_size``, so a below-minimum batch that is
     dispatched is padded up to the minimum rather than compiling a small
-    shape. Padding therefore never exceeds a factor of two and the vectorised
+    shape. Padding never exceeds a factor of two -- except a below-minimum
+    batch, padded up to the ``min_batch_size`` floor -- and the vectorised
     function only ever sees a small, bounded set of leading dimensions: one
     per power of two from ``min_batch_size`` up to ``max_batch_size`` (or from
     1 when the minimum is left at its default). JAX's ``jit`` cache memoises
@@ -760,11 +764,13 @@ def async_vmap_pool(
         padding: How a batch whose size is not a power of two is handled.
             ``"up"`` (the default) zero-pads the batch up to the next power of
             two, so one execution serves the whole batch at the cost of at most
-            a factor of two of compute. ``"down"`` runs the largest power-of-two
-            prefix of the batch and shifts the remaining requests to the next
-            batch, so nothing is ever padded and no odd size is ever compiled,
-            at the cost of extra executions. A split needs only its prefix to
-            reach ``min_batch_size``: a smaller remainder is shifted anyway and
+            a factor of two of compute (or, below ``min_batch_size``, of
+            padding the batch up to the power-of-two floor). ``"down"`` runs
+            the largest power-of-two prefix of the batch and shifts the
+            remaining requests to the next batch, so nothing is ever padded
+            and no odd size is ever compiled, at the cost of extra
+            executions. A split needs only its prefix to reach
+            ``min_batch_size``: a smaller remainder is shifted anyway and
             reuses a compiled size (merging with later arrivals, or running
             below-minimum padded up to the floor) instead of up-rounding the
             whole group and compiling a one-off size.

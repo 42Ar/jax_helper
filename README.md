@@ -15,7 +15,8 @@ them (or anything else) across concurrent calls in one vectorised batch.
 - `async_vmap_pool(max_batch_size, ..., debug=False, padding='up', min_batch_size=1)` —
   async pooled executor over `vmap`; `debug=True` reports each execution and
   its batch size, `padding='down'` runs exact power-of-two prefixes instead of
-  padding, and `min_batch_size` (default 1) holds below-min batches.
+  padding, and `min_batch_size` (default 1) floors the compiled batch size:
+  a below-min batch pads up to it, never held.
 
 Every routine is a coroutine. `f` (and `df`) must be awaitable and return a
 finite scalar; anything else raises `TypeError` or `ValueError`. Scalar solvers
@@ -147,12 +148,13 @@ are zero-padded up to the next power of two (never more than
 `max_batch_size`, and never below `min_batch_size`), then trimmed back to the
 real size. Because every argument is padded, the whole batch keeps a leading
 dimension from a small bounded set — the powers of two from `min_batch_size`
-up to `max_batch_size` (or from `2` at the default minimum) — and JAX's `jit`
+up to `max_batch_size` (or from `1` at the default minimum) — and JAX's `jit`
 cache reuses each compiled entry, so a batch of 100 and one of 128 share the
-same compiled code. Padding therefore never exceeds a factor of two, and a
-workload whose batch sizes keep changing compiles the vectorised function at
-most `log2(max_batch_size) + 1` times. Stacking, padding and trimming all run
-on NumPy, off the compiler.
+same compiled code. Padding therefore never exceeds a factor of two (a
+below-minimum batch is instead padded to the `min_batch_size` power-of-two
+floor), and a workload whose batch sizes keep changing compiles the
+vectorised function at most `log2(max_batch_size) + 1` times. Stacking,
+padding and trimming all run on NumPy, off the compiler.
 
 With `padding="down"`, a batch is instead split: the largest power-of-two
 prefix runs now and the remaining requests shift into the next batch, so no
