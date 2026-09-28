@@ -307,6 +307,24 @@ async def test_sub_min_batch_is_dispatched_whole_and_padded():
 
 
 @pytest.mark.asyncio
+async def test_padding_down_never_leaves_a_sub_min_tail():
+    """A split must leave the remainder at ``min_batch_size`` at least."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, padding="down", min_batch_size=4)
+    results = await asyncio.gather(*[pool.submit(i) for i in range(6)])
+
+    # floor(6) = 4 meets the minimum, but the tail (2) does not: splitting
+    # would run 4 and then recompile a lone 2, so the whole group runs padded.
+    assert results == list(range(6))
+    assert sizes == [6]
+
+
+@pytest.mark.asyncio
 async def test_min_batch_size_holds_small_batches_then_dispatches():
     """Below-min batches wait for the parked condition and the valve."""
     sizes = []

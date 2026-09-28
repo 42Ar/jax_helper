@@ -27,8 +27,10 @@ every leaf to the next power of two, so one execution serves the whole batch
 at the cost of at most a factor of two of compute. With ``padding="down"`` a
 batch instead runs at the largest power-of-two prefix and the remainder is
 shifted to the next batch, so no request is ever padded, at the cost of extra
-executions. Stacking, padding and trimming happen on NumPy arrays off the
-compiler either way.
+executions -- and only when both the prefix and the shift leave at least
+``min_batch_size`` requests each, so a split never leaves a sub-minimum batch
+that would recompile a small shape. Stacking, padding and trimming happen on
+NumPy arrays off the compiler either way.
 
 By default each batch runs on a dedicated worker thread, so the event loop is
 never frozen while NumPy or JAX compute runs; the GIL-releasing C work there
@@ -378,11 +380,17 @@ class _Pool:
             ):
                 # ``padding="down"``: run the largest power-of-two prefix of
                 # the group and shift the remainder to the next batch, so no
-                # request is ever zero-padded. Only split when the prefix is
-                # at least ``min_batch_size``; otherwise the whole group runs
-                # and is padded as usual.
+                # request is ever zero-padded. Only split when both the prefix
+                # and the remainder reach ``min_batch_size``; otherwise the
+                # whole group runs and is padded as usual. Requiring the
+                # remainder to reach the minimum too stops the split leaving a
+                # sub-min batch that would run alone and recompile a small
+                # shape (e.g. 68 with min 64 must not become 64 + 4).
                 floor = 1 << (n.bit_length() - 1)
-                if floor >= self._min_batch_size:
+                if (
+                    floor >= self._min_batch_size
+                    and (n - floor) >= self._min_batch_size
+                ):
                     head, tail = group[:floor], group[floor:]
                     for item in tail:
                         self._queue.put_nowait(item)
@@ -657,13 +665,14 @@ def async_vmap_pool(
             a factor of two of compute. ``"down"`` runs the largest power-of-two
             prefix of the batch and shifts the remaining requests to the next
             batch, so nothing is ever padded, at the cost of extra executions.
-            A batch is only split when the prefix is at least
-            ``min_batch_size``.
+            A batch is split only when both the prefix and the shifted
+            remainder reach ``min_batch_size``, so a split never leaves a
+            sub-minimum batch behind.
         min_batch_size: The minimum number of requests a batch may hold before
             the worker dispatches it, when the parked condition is met.
             Defaults to 1, which waits only for every caller to be parked; a
             larger value makes the pool hold small batches until more requests
-            arrive or the settle valve gives up, and caps the ``"down"``
+            arrive or the settle valve gives up, and gates the ``"down"``
             padding split.
 
     Returns:
