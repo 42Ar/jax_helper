@@ -138,7 +138,7 @@ def _gathering_future_type() -> Optional[type]:
     The parent of a batch of concurrent calls usually waits on an internal
     gathering future rather than on the pool's futures, yet it cannot enqueue
     anything itself: its children do the submitting and park on pool futures
-    directly. The type is used by :meth:`_Pool._all_parked`, which insists the
+    directly. The type is used by :meth:`_Pool._is_parked`, which insists the
     gathering actually reach this pool before counting the parent as parked.
     The class lives in ``asyncio.tasks`` on 3.14+ and ``asyncio.futures``
     before that; both are internal, like ``Task._fut_waiter`` itself.
@@ -151,7 +151,7 @@ def _gathering_future_type() -> Optional[type]:
     return None
 
 
-#: Cached orchestrator type for :meth:`_Pool._all_parked`.
+#: Cached orchestrator type for :meth:`_Pool._is_parked`.
 _GATHERING_FUTURE = _gathering_future_type()
 
 
@@ -299,24 +299,39 @@ class _Pool:
                 )
                 return
 
-    def _gather_depends_on_pool(self, gather_future: Any) -> bool:
-        """Whether a ``gather``, transitively, is waiting on this pool.
+    def _is_parked(
+        self, task: "asyncio.Task[Any]", seen: Optional[set] = None
+    ) -> bool:
+        """Whether ``task`` is parked behind a batch that must run on this pool.
 
-        A gathering future's children (the per-item tasks ``gather`` created)
-        wait on pool futures directly when the gather includes calls into this
-        pool. Only then may the orchestrating parent count as parked: it can
-        enqueue nothing itself, and its next submit happens after this pool
-        resolves, so dispatching is safe. A gather over unrelated work is a
-        caller still computing, not a parked one.
+        A task is parked when the chain of ``await``\\ s it currently stands on
+        ends in one of this pool's pending futures: waiting on that future it
+        cannot enqueue a new request before a batch executes, so the batch is
+        complete and may dispatch. The chain is followed through further tasks
+        (``await some_task`` parks the awaiter on that task object) and through
+        ``gather`` parents (which park on an internal gathering future whose
+        children carry the chain on), and stops at anything else -- a timer, an
+        ``Event``, a lock, an I/O future -- which keeps the task a caller still
+        computing, not a parked one. ``asyncio.Task._fut_waiter`` is a private
+        field but stable across CPython versions.
         """
-        for child in getattr(gather_future, "_children", ()):
-            waiter = getattr(child, "_fut_waiter", None)
-            if waiter in self._pending:
-                return True
-            if _GATHERING_FUTURE is not None and isinstance(
-                waiter, _GATHERING_FUTURE
-            ):
-                if self._gather_depends_on_pool(waiter):
+        if task is self._task or task.done():
+            return False
+        if seen is None:
+            seen = set()
+        if task in seen:
+            # A (theoretically impossible) mutual-await cycle: treat the task
+            # as unparked rather than recurse forever.
+            return False
+        seen.add(task)
+        waiter = getattr(task, "_fut_waiter", None)
+        if waiter in self._pending:
+            return True
+        if isinstance(waiter, asyncio.Task):
+            return self._is_parked(waiter, seen)
+        if _GATHERING_FUTURE is not None and isinstance(waiter, _GATHERING_FUTURE):
+            for child in getattr(waiter, "_children", ()):
+                if not child.done() and self._is_parked(child, seen):
                     return True
         return False
 
@@ -327,26 +342,17 @@ class _Pool:
     def _unparked_tasks(self) -> List["asyncio.Task[Any]"]:
         """The live tasks that are not parked on this pool.
 
-        A task is parked on this pool when the future it awaits is one of the
-        futures handed out by :meth:`submit`. ``asyncio.Task._fut_waiter`` is
-        a private field but stable across CPython versions. A task awaiting a
-        ``gather`` counts as parked only if that gather transitively waits on
-        this pool (:meth:`_gather_depends_on_pool`): the orchestrating parent
-        parks on an internal gathering future and cannot submit, and its
-        children -- which park on pool futures directly -- already count.
+        A task is parked on this pool when the chain of ``await``\\ s it
+        currently stands on ends in one of the futures handed out by
+        :meth:`submit` -- reached directly, through further tasks, or through a
+        ``gather`` parent (:meth:`_is_parked`).
         """
         unparked: List["asyncio.Task[Any]"] = []
         for task in asyncio.all_tasks(self._loop):
             if task is self._task or task.done():
                 continue
-            waiter = getattr(task, "_fut_waiter", None)
-            if waiter in self._pending:
+            if self._is_parked(task):
                 continue
-            if _GATHERING_FUTURE is not None and isinstance(
-                waiter, _GATHERING_FUTURE
-            ):
-                if self._gather_depends_on_pool(waiter):
-                    continue
             unparked.append(task)
         return unparked
 

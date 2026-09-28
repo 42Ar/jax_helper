@@ -177,6 +177,81 @@ async def test_a_gather_of_pool_submits_is_counted_parked():
 
 
 @pytest.mark.asyncio
+async def test_a_task_awaiting_a_task_awaiting_the_pool_dispatches_parked(capsys):
+    """An ``await`` chain ending in the pool counts every hop as parked."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, debug=True, label="chain")
+
+    async def leaf(value):
+        return await pool.submit(value)
+
+    async def middle(value):
+        return await asyncio.create_task(leaf(value))
+
+    results = await asyncio.gather(*[middle(i) for i in range(3)])
+
+    assert results == list(range(3))
+    assert sizes == [3]
+    assert "dispatching after" not in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_deep_chain_awaits_pool_dispatches_parked(capsys):
+    """Several hops of task-awaiting-task still count as parked."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, debug=True, label="deep")
+
+    async def bottom(value):
+        return await pool.submit(value)
+
+    async def mid(value):
+        return await asyncio.create_task(bottom(value))
+
+    async def top(value):
+        return await asyncio.create_task(mid(value))
+
+    results = await asyncio.gather(*[top(i) for i in range(4)])
+
+    assert results == list(range(4))
+    assert sizes == [4]
+    assert "dispatching after" not in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_gather_inside_a_task_still_counts_as_parked(capsys):
+    """A gather nested in a task, reached through another task, stays parked."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, debug=True, label="nested")
+
+    async def inner(value):
+        return await asyncio.gather(*(pool.submit(v) for v in range(value)))
+
+    async def outer(value):
+        return await asyncio.create_task(inner(value))
+
+    results = await asyncio.gather(*[outer(2), outer(2)])
+
+    assert sorted(sum(r) for r in results) == [1, 1]
+    assert sizes == [4]
+    assert "dispatching after" not in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
 async def test_background_task_does_not_starve_the_batch():
     """A task parked on non-pool work cannot stall a batch forever.
 
