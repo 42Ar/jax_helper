@@ -507,6 +507,25 @@ async def test_pad_to_max_never_recompiles_across_batch_sizes():
 
 
 @pytest.mark.asyncio
+async def test_padded_results_are_plain_numpy_arrays():
+    """The executor hands back host NumPy arrays, not jax arrays."""
+    import jax
+
+    @async_vmap_pool(8, pad_to_max=True)
+    def f(x):
+        return x * 2
+
+    results = await asyncio.gather(f(1.0), f(2.0))
+
+    assert [r.shape for r in results] == [(), ()]
+    assert all(
+        isinstance(r, (np.ndarray, np.generic)) and not isinstance(r, jax.Array)
+        for r in results
+    )
+    assert [float(r) for r in results] == [2.0, 4.0]
+
+
+@pytest.mark.asyncio
 async def test_non_numeric_leaf_fails_every_caller():
     @async_vmap_pool(4)
     def f(x, args):

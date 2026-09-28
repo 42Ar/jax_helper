@@ -265,7 +265,6 @@ def _build_executor(
     ever compiled, and once.
     """
     import jax
-    import jax.numpy as jnp
 
     @functools.wraps(scalar_fn)
     def unpack(request: Tuple[Any, ...]) -> Any:
@@ -289,11 +288,9 @@ def _build_executor(
             padded = jax.tree_util.tree_map(
                 lambda arr: _padded(arr, max_batch_size), stacked
             )
-            batch = vmapped(padded)
-            # Trim host-side, then re-wrap so results keep their jax.Array
-            # contract even though the trim never went through JAX.
-            return cast(Sequence[Any], jnp.asarray(np.asarray(batch)[:n]))
-        return cast(Sequence[Any], jnp.asarray(np.asarray(vmapped(stacked))))
+            # Trim host-side; results are plain NumPy arrays.
+            return cast(Sequence[Any], np.asarray(vmapped(padded))[:n])
+        return cast(Sequence[Any], np.asarray(vmapped(stacked)))
 
     return execute
 
@@ -315,7 +312,9 @@ def async_vmap_pool(
     batch size, so short batches still run against a static shape. Stacking,
     padding and trimming all happen on NumPy arrays, so varying batch sizes
     never cause JAX recompilations -- only the vectorised function itself is
-    compiled, and once per distinct structure and dtype.
+    compiled, and once per distinct structure and dtype. Each request resolves
+    to a NumPy array; results are pulled off the device host-side every batch,
+    which is negligible on CPU.
 
     Args:
         max_batch_size: The maximum number of requests drained into one
@@ -323,8 +322,6 @@ def async_vmap_pool(
             is set. Each compatible group within a batch is at most this size.
         pad_to_max: If True, pad short batches up to ``max_batch_size`` with
             zeros so JAX does not recompile for every distinct batch size.
-            Where True results are moved off the device (and back) each batch
-            to do that trimming host-side, which is negligible on CPU.
         debug: If True, print a line to stderr for every execution, naming the
             function and the number of requests in that batch. Useful for
             confirming that concurrent calls really are coalescing.
