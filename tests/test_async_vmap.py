@@ -126,13 +126,14 @@ async def test_parked_waits_for_a_caller_still_computing():
 
 
 @pytest.mark.asyncio
-async def test_an_unrelated_gather_waiter_is_waited_for():
-    """A caller paused on a gather that does not touch the pool is not parked.
+async def test_a_gather_waiter_is_parked_and_does_not_hold_the_batch():
+    """A caller suspended on a gather is parked and does not hold the batch.
 
-    ``_all_parked`` counts a ``gather`` parent as parked only when that
-    gather transitively waits on this pool; an orchestrator of unrelated work
-    is still a caller that can submit, so the open batch must wait for it
-    rather than dispatch early and split the burst.
+    ``_is_parked`` counts a ``gather`` parent as parked: it cannot enqueue
+    until the gather resumes it, and any submitter it spawned is tracked as a
+    task in its own right. So an unrelated orchestrator still suspended on its
+    gather does not keep the open batch waiting -- its later submit joins the
+    next batch.
     """
     sizes = []
 
@@ -142,25 +143,31 @@ async def test_an_unrelated_gather_waiter_is_waited_for():
 
     pool = _pool(execute, max_batch_size=8)
 
+    gate = asyncio.Event()
+
     async def caller():
-        await asyncio.gather(asyncio.sleep(0), asyncio.sleep(0))
+        await asyncio.gather(gate.wait())
         return await pool.submit("late")
 
-    seed = asyncio.create_task(pool.submit("seed"))
     late = asyncio.create_task(caller())
+    seed = asyncio.create_task(pool.submit("seed"))
 
+    # ``caller`` is parked mid-gather here: it cannot have submitted yet, so
+    # ``seed`` is the whole batch and closes on its own.
     assert await seed == "seed"
-    assert await late == "late"
+    gate.set()
 
-    assert sizes == [2]
+    assert await late == "late"
+    assert sizes == [1, 1]
 
 
 @pytest.mark.asyncio
 async def test_a_gather_of_pool_submits_is_counted_parked():
-    """A gather that does reach the pool still coalesces into one batch.
+    """A gather burst still coalesces into one batch.
 
-    Tightening the parked rule to pool-dependent gathers must not cost real
-    gather-based bursts their single execution.
+    The submitters are all queued before the batch closes (the drain merges
+    whatever is queued), so counting the ``gather`` parent as parked never
+    splits a gather-based burst.
     """
     sizes = []
 
@@ -1263,6 +1270,28 @@ async def test_settle_message_names_each_unparked_task(capsys):
     assert "sleeper parked on Future" in output
     assert "chaser awaiting " in output
     assert "sleeper" in output
+
+
+@pytest.mark.asyncio
+async def test_settle_message_condenses_a_large_unparked_set(capsys):
+    """A huge unparked set is reported as per-kind tallies, not dumped whole."""
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="pinned")
+
+    event = asyncio.Event()
+    pinned = [asyncio.create_task(event.wait()) for _ in range(30)]
+    try:
+        assert await pool.submit("x") == "x"
+    finally:
+        for t in pinned:
+            t.cancel()
+
+    output = capsys.readouterr().err
+    assert "30 task(s) were not parked on the pool" in output
+    assert "30 x Event.wait parked on Future" in output
+    assert output.count("Event.wait parked on Future") == 1
 
 
 @pytest.mark.asyncio

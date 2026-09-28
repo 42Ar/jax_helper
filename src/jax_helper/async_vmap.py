@@ -16,11 +16,14 @@ dispatches it once every live task is parked awaiting a result from this pool
 and nothing new is queued -- the whole program is standing on the pool, so no
 more requests can arrive until one of the batches executes -- and, if set, the
 batch holds at least ``min_batch_size`` requests. A caller that is still
-computing (or still on an earlier await) is waited for, so a burst of
-concurrent calls -- even ones that reach the ``submit`` at different moments
--- runs as one execution. ``coalescing="parked"`` is the only mode. A batch
-never grows past ``max_batch_size``, and a lone caller runs with no added
-latency: with no one else active, the first quiet turn dispatches it.
+computing (or parked on a non-pool await such as a timer, an ``Event`` or a
+lock) is waited for, so a burst of concurrent calls -- even ones that reach the
+``submit`` at different moments -- runs as one execution. A caller suspended on
+a ``gather`` is counted as parked: it cannot enqueue until the gather resumes
+it, and any submitter it spawned is tracked independently. ``coalescing=
+"parked"`` is the only mode. A batch never grows past ``max_batch_size``, and a
+lone caller runs with no added latency: with no one else active, the first
+quiet turn dispatches it.
 
 With ``padding="up"`` (the default) a batch is zero-padded along axis 0 of
 every leaf to the next power of two, so one execution serves the whole batch
@@ -57,7 +60,7 @@ import functools
 import importlib
 import sys
 import weakref
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import (
     Any,
@@ -65,6 +68,7 @@ from typing import (
     Dict,
     Hashable,
     List,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -131,6 +135,24 @@ _SETTLE_TIMEOUT = 0.1
 #: thread is all it can ever use.
 _MAX_WORKERS = 1
 
+#: Largest unparked-task list printed verbatim in the settle-valve debug line.
+#: A program with thousands of concurrent tasks would otherwise drown the line
+#: in entries, so anything larger is condensed to per-kind totals instead.
+_UNPARKED_LIST_LIMIT = 20
+
+
+class _UnparkedDetails(NamedTuple):
+    """Result of :meth:`_Pool._describe_unparked`.
+
+    ``total`` is the number of unparked tasks and ``items`` their
+    descriptions, listed verbatim up to ``_UNPARKED_LIST_LIMIT`` and condensed
+    to per-kind totals beyond that, so the settle-valve line stays readable at
+    any scale.
+    """
+
+    total: int
+    items: List[str]
+
 
 def _gathering_future_type() -> Optional[type]:
     """The asyncio type a ``gather`` parent parks on.
@@ -138,10 +160,11 @@ def _gathering_future_type() -> Optional[type]:
     The parent of a batch of concurrent calls usually waits on an internal
     gathering future rather than on the pool's futures, yet it cannot enqueue
     anything itself: its children do the submitting and park on pool futures
-    directly. The type is used by :meth:`_Pool._is_parked`, which insists the
-    gathering actually reach this pool before counting the parent as parked.
-    The class lives in ``asyncio.tasks`` on 3.14+ and ``asyncio.futures``
-    before that; both are internal, like ``Task._fut_waiter`` itself.
+    directly. The type is used by :meth:`_Pool._is_parked`, which counts such a
+    parent as parked -- a gather is a suspension point, and anything it spawns
+    is tracked as a task in its own right. The class lives in ``asyncio.tasks``
+    on 3.14+ and ``asyncio.futures`` before that; both are internal, like
+    ``Task._fut_waiter`` itself.
     """
     for modname in ("asyncio.tasks", "asyncio.futures"):
         mod = importlib.import_module(modname)
@@ -292,9 +315,9 @@ class _Pool:
                     valve.append(f"time budget ({_SETTLE_TIMEOUT * 1000:.1f} ms)")
                 details = self._describe_unparked()
                 bits = (
-                    [f"{len(details)} task(s) were not parked on the pool: "
-                     + "; ".join(details)]
-                    if details
+                    [f"{details.total} task(s) were not parked on the pool: "
+                     + "; ".join(details.items)]
+                    if details.total
                     else []
                 )
                 if self._min_batch_size > 1 and len(batch) < self._min_batch_size:
@@ -321,12 +344,14 @@ class _Pool:
         ends in one of this pool's pending futures: waiting on that future it
         cannot enqueue a new request before a batch executes, so the batch is
         complete and may dispatch. The chain is followed through further tasks
-        (``await some_task`` parks the awaiter on that task object) and through
-        ``gather`` parents (which park on an internal gathering future whose
-        children carry the chain on), and stops at anything else -- a timer, an
-        ``Event``, a lock, an I/O future -- which keeps the task a caller still
-        computing, not a parked one. ``asyncio.Task._fut_waiter`` is a private
-        field but stable across CPython versions.
+        (``await some_task`` parks the awaiter on that task object). A task
+        suspended on a ``gather`` parent is parked too: the ``gather`` is a
+        stopping point from which nothing can enqueue until it resumes, and
+        any submitters it spawned are already tracked as tasks of their own.
+        Anything else -- a timer, an ``Event``, a lock, an I/O future -- keeps
+        the task a caller still computing, not a parked one.
+        ``asyncio.Task._fut_waiter`` is a private field but stable across
+        CPython versions.
         """
         if task is self._task or task.done():
             return False
@@ -343,9 +368,11 @@ class _Pool:
         if isinstance(waiter, asyncio.Task):
             return self._is_parked(waiter, seen)
         if _GATHERING_FUTURE is not None and isinstance(waiter, _GATHERING_FUTURE):
-            for child in getattr(waiter, "_children", ()):
-                if not child.done() and self._is_parked(child, seen):
-                    return True
+            # Suspended mid-``gather``: it cannot enqueue until the gather
+            # resumes it. The gathered children are enumerated separately by
+            # :meth:`_unparked_tasks`, so counting this parent too would only
+            # double-count every submitter it spawned.
+            return True
         return False
 
     def _all_parked(self) -> bool:
@@ -357,8 +384,9 @@ class _Pool:
 
         A task is parked on this pool when the chain of ``await``\\ s it
         currently stands on ends in one of the futures handed out by
-        :meth:`submit` -- reached directly, through further tasks, or through a
-        ``gather`` parent (:meth:`_is_parked`).
+        :meth:`submit` -- reached directly or through further tasks -- or when
+        it is suspended on a ``gather``, which cannot enqueue until it resumes
+        (:meth:`_is_parked`).
         """
         unparked: List["asyncio.Task[Any]"] = []
         for task in asyncio.all_tasks(self._loop):
@@ -369,13 +397,16 @@ class _Pool:
             unparked.append(task)
         return unparked
 
-    def _describe_unparked(self) -> List[str]:
+    def _describe_unparked(self) -> _UnparkedDetails:
         """Name each unparked task and what it is currently parked on.
 
         Future types are mostly opaque, so the practical clue is which
         coroutine is involved and what its waiter is: a not-yet-started task,
-        another task being awaited, a ``gather`` over unrelated work, or a
-        future class. The names feed the settle-valve debug line.
+        another task being awaited, or a future class. The names feed the
+        settle-valve debug line. Once more than ``_UNPARKED_LIST_LIMIT`` tasks
+        are unparked - a program holding thousands of concurrent callers - a
+        verbatim listing would swamp the line, so it collapses to one line per
+        distinct description, counting how many tasks share it.
         """
         descriptions: List[str] = []
         for task in self._unparked_tasks():
@@ -392,12 +423,18 @@ class _Pool:
             elif _GATHERING_FUTURE is not None and isinstance(
                 waiter, _GATHERING_FUTURE
             ):
-                descriptions.append(f"{name} awaiting an unrelated gather")
+                descriptions.append(f"{name} mid-gather")
             else:
                 descriptions.append(
                     f"{name} parked on {type(waiter).__name__}"
                 )
-        return descriptions
+        if len(descriptions) <= _UNPARKED_LIST_LIMIT:
+            return _UnparkedDetails(len(descriptions), descriptions)
+        counts = Counter(descriptions)
+        return _UnparkedDetails(
+            len(descriptions),
+            [f"{n} x {kind}" for kind, n in counts.most_common()],
+        )
 
     async def _dispatch_grouped(self, batch: List[_Request]) -> None:
         """Split the batch into compatible groups and execute each.

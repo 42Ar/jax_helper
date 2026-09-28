@@ -125,7 +125,12 @@ until every coroutine still computing has reached its `submit` and parked
 awaiting a result from the pool, then dispatches — so a burst of `await`s in
 one `asyncio.gather` runs as a single vectorised execution, and even a trickle
 arriving one call per event-loop turn is captured by one batch. A caller still
-doing synchronous work before submitting is waited for rather than missed. By
+doing synchronous work before submitting is waited for rather than missed. A
+coroutine suspended on an `asyncio.gather` counts as parked — it cannot
+enqueue until the gather resumes it, and any submitter it spawned is tracked
+as a task in its own right — so an orchestrator fanning out hundreds of calls
+(say `roots_chebyshev` over many intervals) never holds the batch open on its
+own account. By
 default the batch runs on a dedicated worker thread (one per pool), so the
 event loop is never blocked — JAX and NumPy release the GIL during their C
 work; pass `run_in_thread=False` to run the batch inline in the worker task
@@ -188,6 +193,16 @@ outcome. The first time a rounded batch size reaches the compiler, a
 `compiling batch size N (for M requests)` line is printed too, so you can see
 which entries the `jit` cache is actually paying for; repeats reuse them
 silently.
+
+If the parked condition cannot be met — a task pinned on a non-pool await (an
+`Event`, a listener, an I/O loop) — a settle safety valve dispatches the batch
+after roughly `_SETTLE_TURNS` idle turns or `_SETTLE_TIMEOUT` seconds,
+whichever comes first, and the `dispatching after ...` line names which one
+and lists the tasks that were not parked. When thousands of tasks are
+involved the list is condensed to one line per kind with a count each (e.g.
+`2508 task(s) were not parked on the pool: 1543 _wrap_f.wrapper not started
+yet; 965 solve_cavity.solve_async parked on Future`), instead of dumping every
+task.
 
 ### Limits
 
