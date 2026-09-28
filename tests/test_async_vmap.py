@@ -1295,6 +1295,46 @@ async def test_debug_reports_when_a_new_batch_size_compiles(capsys):
 
 
 @pytest.mark.asyncio
+async def test_below_min_batch_compiles_at_min_batch_size(capsys):
+    """A below-minimum batch pads up to ``min_batch_size``, not its own size."""
+    @async_vmap_pool(max_batch_size=8, min_batch_size=4, debug=True)
+    def f(x):
+        return x * 2
+
+    three = await asyncio.gather(f(1.0), f(2.0), f(3.0))
+
+    compiles = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "compiling batch size" in line
+    ]
+    assert len(compiles) == 1
+    assert "f: compiling batch size 4 (for 3 requests)" in compiles[0]
+    assert [float(v) for v in three] == [2.0, 4.0, 6.0]
+
+
+@pytest.mark.asyncio
+async def test_below_min_batches_reuse_one_rounded_entry(capsys):
+    """Sub-minimum batches of different sizes share one rounded entry."""
+    @async_vmap_pool(max_batch_size=8, min_batch_size=4, debug=True)
+    def f(x):
+        return x * 2
+
+    three = await asyncio.gather(f(1.0), f(2.0), f(3.0))  # size 4
+    two = await asyncio.gather(f(7.0), f(8.0))            # size 4, cached
+
+    compiles = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "compiling batch size" in line
+    ]
+    assert len(compiles) == 1
+    assert "f: compiling batch size 4 (for 3 requests)" in compiles[0]
+    assert [float(v) for v in three] == [2.0, 4.0, 6.0]
+    assert [float(v) for v in two] == [14.0, 16.0]
+
+
+@pytest.mark.asyncio
 async def test_decorator_debug_flag_reports_every_dispatch(capsys):
     @async_vmap_pool(max_batch_size=4, debug=True)
     def f(x):

@@ -29,8 +29,12 @@ batch instead runs at the largest power-of-two prefix and the remainder is
 shifted to the next batch, so no request is ever padded, at the cost of extra
 executions -- and only when both the prefix and the shift leave at least
 ``min_batch_size`` requests each, so a split never leaves a sub-minimum batch
-that would recompile a small shape. Stacking, padding and trimming happen on
-NumPy arrays off the compiler either way.
+that would recompile a small shape. In either mode a batch dispatched below
+``min_batch_size`` is padded up to it, so the compiled leading dimension
+never dips below the minimum: a lone call or a wave leftover shares one
+compiled entry with every other sub-minimum batch that rounds to the same
+size instead of recompiling a small shape. Stacking, padding and trimming
+happen on NumPy arrays off the compiler either way.
 
 By default each batch runs on a dedicated worker thread, so the event loop is
 never frozen while NumPy or JAX compute runs; the GIL-releasing C work there
@@ -527,6 +531,7 @@ def _build_executor(
     max_batch_size: int,
     debug: bool = False,
     label: Optional[str] = None,
+    min_batch_size: int = 1,
 ) -> Execute:
     """Compile ``scalar_fn`` under ``jit(vmap(...))`` and return an executor.
 
@@ -541,12 +546,15 @@ def _build_executor(
     itself.
 
     Short batches are zero-padded along axis 0 of every leaf up to the next
-    power of two (no more than ``max_batch_size``), so padding never exceeds a
-    factor of two and the vectorised function only ever sees a small, bounded
-    set of leading dimensions: one per power of two from 2 up to
-    ``max_batch_size``. JAX's ``jit`` cache memoises the result, so each
-    distinct rounded size is compiled once and reused forever after -- a
-    workload with wildly varying batch sizes pays at most
+    power of two (no more than ``max_batch_size``) -- and never below the next
+    power of two of ``min_batch_size``, so a below-minimum batch that is
+    dispatched is padded up to the minimum rather than compiling a small
+    shape. Padding therefore never exceeds a factor of two and the vectorised
+    function only ever sees a small, bounded set of leading dimensions: one
+    per power of two from ``min_batch_size`` up to ``max_batch_size`` (or from
+    1 when the minimum is left at its default). JAX's ``jit`` cache memoises
+    the result, so each distinct rounded size is compiled once and reused
+    forever after -- a workload with wildly varying batch sizes pays at most
     ``log2(max_batch_size) + 1`` compilations. The glue -- stacking, padding,
     and trimming back to the real batch size -- runs on NumPy arrays, where
     varying sizes are free and never touch the compiler.
@@ -570,8 +578,14 @@ def _build_executor(
         # Round the real batch size up to the next power of two (capped at
         # max_batch_size), so a batch of 100 runs on 128 and one of 1000 on
         # 1000: padding overhead ≤ 2x, and each distinct rounded size is a
-        # single compiled entry reused by every batch that rounds to it.
-        size = min(1 << (n - 1).bit_length(), max_batch_size)
+        # single compiled entry reused by every batch that rounds to it. The
+        # floor is never below ``min_batch_size``: a below-minimum batch that
+        # gets dispatched (a wave leftover, a lone caller) is padded up to the
+        # minimum instead of compiling a small shape, and every sub-minimum
+        # batch that rounds there shares that one compiled entry.
+        size = min(
+            1 << (max(n, min_batch_size) - 1).bit_length(), max_batch_size
+        )
         # The stack, pad and trim are the batch *glue*, and it deliberately
         # runs on NumPy rather than jnp. The vectorised function below is the
         # only thing that should ever reach the compiler; sizing it with every
@@ -673,7 +687,11 @@ def async_vmap_pool(
             Defaults to 1, which waits only for every caller to be parked; a
             larger value makes the pool hold small batches until more requests
             arrive or the settle valve gives up, and gates the ``"down"``
-            padding split.
+            padding split. It also floors the compiled leading dimension: a
+            dispatched batch of fewer than ``min_batch_size`` requests is
+            padded up to the next power of two of the minimum, so a wave
+            leftover or a lone call neither recompiles a small shape nor shares
+            nothing -- it reuses the rounded entry like any other batch.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -729,6 +747,7 @@ def async_vmap_pool(
             max_batch_size,
             debug=debug,
             label=getattr(scalar_fn, "__name__", ""),
+            min_batch_size=min_batch_size,
         )
 
         # Keyed by the running loop, so each loop gets a private pool. Weak, so
