@@ -431,8 +431,14 @@ async def test_sub_min_batch_is_dispatched_whole_and_padded():
 
 
 @pytest.mark.asyncio
-async def test_padding_down_never_leaves_a_sub_min_tail():
-    """A split must leave the remainder at ``min_batch_size`` at least."""
+async def test_padding_down_shifts_a_sub_min_tail_to_the_next_batch():
+    """A tail below ``min_batch_size`` is still split off and run later.
+
+    The whole group is never up-rounded to a brand-new compiled size: the
+    exact power-of-two prefix runs now, and the small remainder closes as a
+    below-minimum batch padded up to the ``min_batch_size`` floor -- a
+    compiled entry that is reused.
+    """
     sizes = []
 
     def execute(requests):
@@ -442,10 +448,10 @@ async def test_padding_down_never_leaves_a_sub_min_tail():
     pool = _pool(execute, max_batch_size=8, padding="down", min_batch_size=4)
     results = await asyncio.gather(*[pool.submit(i) for i in range(6)])
 
-    # floor(6) = 4 meets the minimum, but the tail (2) does not: splitting
-    # would run 4 and then recompile a lone 2, so the whole group runs padded.
+    # floor(6) = 4 meets the minimum; the tail (2) does not, but it is shifted
+    # to the next batch anyway and runs padded up to the reused 4 floor.
     assert results == list(range(6))
-    assert sizes == [6]
+    assert sizes == [4, 2]
 
 
 @pytest.mark.asyncio
@@ -1637,6 +1643,41 @@ async def test_below_min_batches_reuse_one_rounded_entry(capsys):
     assert "f: compiling batch size 4 (for 3 requests)" in compiles[0]
     assert [float(v) for v in three] == [2.0, 4.0, 6.0]
     assert [float(v) for v in two] == [14.0, 16.0]
+
+
+@pytest.mark.asyncio
+async def test_padding_down_never_compiles_truncated_whole_batches(capsys):
+    """A below-minimum tail is shifted, never up-rounded into a new compile.
+
+    A group such as 6 with ``min_batch_size=4`` used to fall back to padding
+    the whole batch up to 8, compiling a one-off size nothing else reuses.
+    It is now split (4 exact, 2 shifted) so only the reused 4 floor ever
+    compiles -- no 8 entry.
+    """
+    @async_vmap_pool(
+        max_batch_size=8, padding="down", min_batch_size=4, debug=True
+    )
+    def f(x):
+        return x * 2
+
+    six = await asyncio.gather(*[f(float(i)) for i in range(6)])
+    four = await asyncio.gather(*[f(float(i) + 10.0) for i in range(4)])
+    six_again = await asyncio.gather(*[f(float(i) + 20.0) for i in range(6)])
+    lone = await f(30.0)
+
+    compiles = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "compiling batch size" in line
+    ]
+    assert [l for l in compiles if "batch size 8" in l] == []
+    assert all("compiling batch size 4" in l for l in compiles)
+    assert [float(v) for v in six] == [float(i) * 2 for i in range(6)]
+    assert [float(v) for v in four] == [float(i) * 2 + 20.0 for i in range(4)]
+    assert [float(v) for v in six_again] == [
+        float(i) * 2 + 40.0 for i in range(6)
+    ]
+    assert float(lone) == 60.0
 
 
 @pytest.mark.asyncio

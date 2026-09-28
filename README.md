@@ -157,9 +157,13 @@ on NumPy, off the compiler.
 With `padding="down"`, a batch is instead split: the largest power-of-two
 prefix runs now and the remaining requests shift into the next batch, so no
 request is ever padded — at the cost of extra executions (seven requests run
-as `4 + 2 + 1`). A batch is split only when both the prefix and the shifted
-remainder reach `min_batch_size`, so a split never leaves a sub-minimum batch
-(68 with min 64 runs as one padded batch rather than `64 + 4`).
+as `4 + 2 + 1`). Only the prefix must reach `min_batch_size`; a smaller
+remainder is shifted anyway and reuses a compiled size — either it merges
+with later arrivals or it closes below-minimum and is padded up to the
+`min_batch_size` floor, a compiled entry that is shared. So `"down"` never
+up-rounds a whole odd batch (68 with min 64 runs as `64` now and `4` in the
+next, both reusing compiled entries) the way `"up"` would, and it never
+compiles a one-off size.
 
 Each event loop gets its own pool, so the decorated function is usable from
 several loops concurrently without them interfering.

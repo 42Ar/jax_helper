@@ -29,10 +29,14 @@ With ``padding="up"`` (the default) a batch is zero-padded along axis 0 of
 every leaf to the next power of two, so one execution serves the whole batch
 at the cost of at most a factor of two of compute. With ``padding="down"`` a
 batch instead runs at the largest power-of-two prefix and the remainder is
-shifted to the next batch, so no request is ever padded, at the cost of extra
-executions -- and only when both the prefix and the shift leave at least
-``min_batch_size`` requests each, so a split never leaves a sub-minimum batch
-that would recompile a small shape. In either mode a batch dispatched below
+shifted to the next batch, so no request is ever padded and nothing is ever
+zero-padded up to a brand-new compiled size, at the cost of extra executions.
+Only the prefix must reach ``min_batch_size`` for a split to happen: a
+sub-minimum remainder re-enters the next collection and either merges with
+later arrivals or closes as a below-minimum batch padded up to the
+``min_batch_size`` floor, a compiled entry that is reused -- so ``"down"``
+never up-rounds a whole odd batch (e.g. 68 with min 64 never compiles a
+one-off 128) the way ``"up"`` would. In either mode a batch dispatched below
 ``min_batch_size`` is padded up to it, so the compiled leading dimension
 never dips below the minimum: a lone call or a wave leftover shares one
 compiled entry with every other sub-minimum batch that rounds to the same
@@ -463,17 +467,18 @@ class _Pool:
             ):
                 # ``padding="down"``: run the largest power-of-two prefix of
                 # the group and shift the remainder to the next batch, so no
-                # request is ever zero-padded. Only split when both the prefix
-                # and the remainder reach ``min_batch_size``; otherwise the
-                # whole group runs and is padded as usual. Requiring the
-                # remainder to reach the minimum too stops the split leaving a
-                # sub-min batch that would run alone and recompile a small
-                # shape (e.g. 68 with min 64 must not become 64 + 4).
+                # request is ever zero-padded to a brand-new size. The prefix
+                # must reach ``min_batch_size`` (a sub-minimum head would only
+                # rerun the padded floor anyway); the remainder has no such
+                # bar -- however small, it re-enters the next collection and
+                # either merges with later arrivals or closes as a below-min
+                # batch padded up to the ``min_batch_size`` floor, a compiled
+                # entry that is reused. Up-rounding the whole group (e.g. 68
+                # with min 64 as one 128 batch) is deliberately avoided: it
+                # both pads real request slots and compiles a one-off size
+                # nothing else may ever use.
                 floor = 1 << (n.bit_length() - 1)
-                if (
-                    floor >= self._min_batch_size
-                    and (n - floor) >= self._min_batch_size
-                ):
+                if floor >= self._min_batch_size:
                     head, tail = group[:floor], group[floor:]
                     for item in tail:
                         self._queue.put_nowait(item)
@@ -757,10 +762,12 @@ def async_vmap_pool(
             two, so one execution serves the whole batch at the cost of at most
             a factor of two of compute. ``"down"`` runs the largest power-of-two
             prefix of the batch and shifts the remaining requests to the next
-            batch, so nothing is ever padded, at the cost of extra executions.
-            A batch is split only when both the prefix and the shifted
-            remainder reach ``min_batch_size``, so a split never leaves a
-            sub-minimum batch behind.
+            batch, so nothing is ever padded and no odd size is ever compiled,
+            at the cost of extra executions. A split needs only its prefix to
+            reach ``min_batch_size``: a smaller remainder is shifted anyway and
+            reuses a compiled size (merging with later arrivals, or running
+            below-minimum padded up to the floor) instead of up-rounding the
+            whole group and compiling a one-off size.
         min_batch_size: The minimum number of requests a batch may hold before
             the worker dispatches it, when the parked condition is met.
             Defaults to 1, which waits only for every caller to be parked. The
@@ -772,7 +779,9 @@ def async_vmap_pool(
             of the minimum, so a wave leftover or a lone call neither
             recompiles a small shape nor shares nothing -- it reuses the
             rounded entry like any other batch. It also gates the ``"down"``
-            padding split, so a split never leaves a sub-minimum batch behind.
+            padding split: a prefix below the minimum is not worth running on
+            its own, so a group whose largest power-of-two prefix stays under
+            ``min_batch_size`` runs whole and is padded to the floor instead.
 
     Returns:
         A decorator producing an async function that awaits to its result.
