@@ -129,7 +129,7 @@ async def test_parked_waits_for_a_caller_still_computing():
 async def test_background_task_does_not_starve_the_batch():
     """A task parked on non-pool work cannot stall a batch forever.
 
-    The parked rule falls back to a couple of silent turns, so a background
+    The parked rule falls back to a few silent turns, so a background
     coroutine idling on its own await never blocks a lone caller.
     """
     sizes = []
