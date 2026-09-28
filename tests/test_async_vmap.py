@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 
 import numpy as np
 import pytest
@@ -561,6 +562,20 @@ async def test_debug_reports_the_function_name(capsys):
     await pool.submit(1)
 
     assert "roots_scan" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_a_datetime_timestamp(capsys):
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="f")
+    await pool.submit(1)
+
+    line = capsys.readouterr().err.splitlines()[0]
+    stamp, rest = line.split("]", 1)
+    datetime.fromisoformat(stamp[1:])  # raises if not a valid datetime
+    assert "executing 1 request(s)" in rest
 
 
 @pytest.mark.asyncio

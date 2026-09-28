@@ -128,8 +128,8 @@ several loops concurrently without them interfering.
 
 ### Debugging the batching
 
-`debug=True` prints one line per execution to **stderr**, naming the function
-and how many requests that execution carried:
+`debug=True` prints one line per execution to **stderr**, naming the function,
+how many requests that execution carried, and a wall-clock timestamp:
 
 ```python
 @async_vmap_pool(max_batch_size=4, debug=True)
@@ -137,9 +137,9 @@ def quad(x, args):
     return args["scale"] * x ** 2 + args["bias"]
 
 # ten concurrent calls, at most four per batch:
-# [async_vmap_pool] quad: executing 4 request(s)
-# [async_vmap_pool] quad: executing 4 request(s)
-# [async_vmap_pool] quad: executing 2 request(s)
+# [2026-09-28 05:41:06.123] [async_vmap_pool] quad: executing 4 request(s)
+# [2026-09-28 05:41:06.124] [async_vmap_pool] quad: executing 4 request(s)
+# [2026-09-28 05:41:06.125] [async_vmap_pool] quad: executing 2 request(s)
 ```
 
 The count is the number of **real requests**, not the padded size, and it is

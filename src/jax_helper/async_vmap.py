@@ -24,6 +24,7 @@ its own. The JAX adapter at the bottom of this module supplies both.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import functools
 import sys
 import weakref
@@ -130,9 +131,10 @@ class _Pool:
         """
         if not self._debug:
             return
+        stamp = datetime.datetime.now().isoformat(sep=" ", timespec="milliseconds")
         print(
-            f"[async_vmap_pool] {self._label or 'function'}: executing "
-            f"{len(group)} request(s)",
+            f"[{stamp}] [async_vmap_pool] {self._label or 'function'}: "
+            f"executing {len(group)} request(s)",
             file=sys.stderr,
         )
 
