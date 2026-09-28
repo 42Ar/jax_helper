@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 import numpy as np
@@ -132,6 +133,86 @@ async def test_batch_never_exceeds_max_batch_size():
     assert results == list(range(20))
     assert max(sizes) <= 8
     assert sum(sizes) == 20
+
+
+@pytest.mark.asyncio
+async def test_linger_captures_timer_delayed_callers():
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, linger=0.05)
+
+    async def delayed():
+        await asyncio.sleep(0.02)
+        return await pool.submit("delayed")
+
+    results = await asyncio.gather(pool.submit("first"), delayed())
+
+    assert sorted(results) == ["delayed", "first"]
+    assert sizes == [2]
+
+
+@pytest.mark.asyncio
+async def test_linger_zero_leaves_quiescent_default():
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8)
+
+    async def delayed():
+        await asyncio.sleep(0.02)
+        return await pool.submit("delayed")
+
+    results = await asyncio.gather(pool.submit("first"), delayed())
+
+    assert sorted(results) == ["delayed", "first"]
+    assert sizes == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_linger_respects_max_batch_size():
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=2, linger=0.05)
+
+    async def delayed():
+        await asyncio.sleep(0.02)
+        return await pool.submit("d")
+
+    results = await asyncio.gather(pool.submit("a"), pool.submit("b"), delayed())
+
+    assert sorted(results) == ["a", "b", "d"]
+    assert sizes == [2, 1]
+
+
+@pytest.mark.asyncio
+async def test_linger_bounds_a_lone_callers_latency():
+    calls = []
+
+    def execute(requests):
+        calls.append(time.perf_counter())
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, linger=0.02)
+
+    start = time.perf_counter()
+    await pool.submit(1)
+    elapsed = time.perf_counter() - start
+
+    # Dispatched only once the linger has elapsed, not right away.
+    assert elapsed >= 0.015
+    assert elapsed < 0.25
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
@@ -340,6 +421,18 @@ def test_coalescing_must_be_a_known_mode():
     # Both documented modes are accepted.
     async_vmap_pool(8, coalescing="quiescent")
     async_vmap_pool(8, coalescing="opportunistic")
+
+
+def test_linger_must_be_non_negative():
+    with pytest.raises(ValueError, match="linger must be at least 0"):
+        async_vmap_pool(8, linger=-0.5)
+
+
+def test_linger_must_be_a_number():
+    with pytest.raises(TypeError, match="linger must be a number"):
+        async_vmap_pool(8, linger="soon")  # type: ignore[arg-type]
+    async_vmap_pool(8, linger=0)
+    async_vmap_pool(8, linger=0.01)
 
 
 @pytest.mark.asyncio

@@ -125,8 +125,12 @@ execution. `coalescing="quiescent"` (the default) waits until every
 currently-runnable coroutine has had a turn and none enqueued more — even a
 trickle arriving one call per turn is captured by one batch; 
 `coalescing="opportunistic"` yields once and runs whatever is queued, so a
-slow trickle is split into several batches. Either way a lone caller runs with
-no added latency, and no batch ever exceeds `max_batch_size`.
+slow trickle is split into several batches. With `linger=0.02` the worker
+instead keeps the batch open for up to 20 ms — enough to also capture callers
+that are still inside `await asyncio.sleep(...)` or blocked on I/O — at the
+cost of that bounded delay for every caller in the batch. Without a `linger`,
+a lone caller runs with no added latency, and no batch ever exceeds
+`max_batch_size`.
 
 Arguments and leaves inside a short batch are zero-padded up to the next
 power of two (never more than `max_batch_size`), then trimmed back to the real
@@ -184,9 +188,11 @@ silently.
 - **Everything is traced.** Values arrive as JAX tracers, so you cannot branch
   on them in Python. Use `jax.lax.cond` or similar, or capture the constant
   lexically in a closure factory if you need real Python control flow.
-- **Batching is opportunistic, not a guarantee.** A lone caller runs with no
-  added latency, and a batch never waits past the point where the event loop
-  has settled; callers that arrive later simply go in the next batch.
+- **Batching is opportunistic, not a guarantee.** By default a lone caller
+  runs with no added latency, and a batch never waits past the point where the
+  event loop has settled; callers that arrive later simply go in the next
+  batch. Opt in to a bounded wait with `linger=...` if you need late callers
+  (sleeping or I/O-bound) in the same batch.
 
 ## Install
 

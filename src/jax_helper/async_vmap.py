@@ -13,11 +13,13 @@ stacking them is possible, so free-varying arguments cost nothing.
 
 Batching is *coalescing*: the worker keeps the current batch open while
 concurrent callers keep arriving and dispatches it once the event loop has
-settled. ``coalescing="quiescent"`` (the default) waits  until every
+settled. ``coalescing="quiescent"`` (the default) waits until every
 currently-runnable coroutine has had a turn and none enqueued more, so the
 whole burst runs as one batch; ``coalescing="opportunistic"`` yields once and
-dispatches whatever is queued. Either way a lone caller runs with no added
-latency, and a batch never grows past ``max_batch_size``.
+dispatches whatever is queued. Passing ``linger`` waits up to that many
+seconds for callers that are still sleeping or blocked on I/O. Either way a
+batch never grows past ``max_batch_size``; with no ``linger`` a lone caller
+runs with no added latency, and with a ``linger`` it waits at most that long.
 
 The pooling machinery is plain asyncio and knows nothing about JAX: it takes
 injected ``key`` and ``execute`` callables, which is what makes it testable on
@@ -86,6 +88,7 @@ class _Pool:
         debug: bool = False,
         label: str = "",
         coalescing: str = "quiescent",
+        linger: float = 0.0,
     ) -> None:
         self._execute = execute
         self._key = key
@@ -94,6 +97,7 @@ class _Pool:
         self._debug = debug
         self._label = label
         self._coalescing = coalescing
+        self._linger = linger
         self._queue: "asyncio.Queue[_Request]" = asyncio.Queue()
         self._task: Optional["asyncio.Task[None]"] = None
         self._pending: "set[asyncio.Future[Any]]" = set()
@@ -118,11 +122,34 @@ class _Pool:
         while True:
             request, future = await self._queue.get()
             batch: List[_Request] = [(request, future)]
-            if self._coalescing == "quiescent":
+            if self._linger > 0.0:
+                await self._collect_with_linger(batch)
+            elif self._coalescing == "quiescent":
                 await self._collect_until_settled(batch)
             else:
                 await self._collect_immediately(batch)
             self._dispatch_grouped(batch)
+
+    async def _collect_with_linger(self, batch: List[_Request]) -> None:
+        """Wait up to ``linger`` seconds for more callers, then dispatch.
+
+        The time-based mode: the batch stays open until it is full or until
+        ``linger`` seconds have passed since it opened, by which point even a
+        caller still inside ``asyncio.sleep`` or blocked on I/O has had time
+        to arrive. A lone caller therefore waits the full ``linger``.
+        """
+        deadline = self._loop.time() + self._linger
+        while len(batch) < self._max_batch_size:
+            remaining = deadline - self._loop.time()
+            if remaining <= 0.0:
+                return
+            try:
+                request, future = await asyncio.wait_for(
+                    self._queue.get(), remaining
+                )
+            except asyncio.TimeoutError:
+                return
+            batch.append((request, future))
 
     async def _collect_until_settled(self, batch: List[_Request]) -> None:
         """Grow the batch until no other coroutine is ready to enqueue.
@@ -367,6 +394,7 @@ def async_vmap_pool(
     max_batch_size: int,
     debug: bool = False,
     coalescing: str = "quiescent",
+    linger: float = 0.0,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
 
@@ -392,13 +420,19 @@ def async_vmap_pool(
             function and the number of requests in that batch, plus a line
             whenever a new batch size is compiled. Useful for confirming that
             concurrent calls really are coalescing and that sizes are shared.
-        coalescing: How long the worker keeps a batch open while collecting.
-            ``"quiescent"`` (the default) waits until every currently-runnable
-            coroutine has had a turn and none enqueued more, so all batched
-            callers are captured by one execution; ``"opportunistic"`` yields
-            once and dispatches whatever is queued, so callers that arrive a
-            turn later run as their own batch. A lone caller runs with no
-            added latency under both.
+        coalescing: How the worker decides the batch is complete when
+            ``linger`` is 0. ``"quiescent"`` (the default) waits until every
+            currently-runnable coroutine has had a turn and none enqueued
+            more, so all batched callers are captured by one execution;
+            ``"opportunistic"`` yields once and dispatches whatever is
+            queued, so callers that arrive a turn later run as their own
+            batch. A lone caller runs with no added latency under both.
+        linger: If greater than 0, the number of seconds a batch stays open
+            for more callers before it is dispatched, in addition to the
+            ``coalescing`` rule. This gives callers that are still sleeping
+            or blocked on I/O time to arrive and join the batch. A lone
+            caller therefore waits up to ``linger`` before its batch runs.
+            Takes precedence over ``coalescing``.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -408,9 +442,11 @@ def async_vmap_pool(
     several loops (or from several tests) without them interfering.
 
     Raises:
-        TypeError: If ``max_batch_size`` is not an ``int``.
-        ValueError: If ``max_batch_size`` is less than 1, or ``coalescing``
-            is not ``"quiescent"`` or ``"opportunistic"``.
+        TypeError: If ``max_batch_size`` is not an ``int``, or ``linger`` is
+            not a number.
+        ValueError: If ``max_batch_size`` is less than 1, ``linger`` is
+            negative, or ``coalescing`` is not ``"quiescent"`` or
+            ``"opportunistic"``.
     """
     if not isinstance(max_batch_size, int):
         raise TypeError(
@@ -425,6 +461,15 @@ def async_vmap_pool(
             "coalescing must be 'quiescent' or 'opportunistic', "
             f"got {coalescing!r}"
         )
+    if isinstance(linger, bool) or not isinstance(linger, (int, float)):
+        raise TypeError(
+            f"linger must be a number, got {type(linger).__name__}"
+        )
+    if linger < 0:
+        raise ValueError(
+            f"linger must be at least 0, got {linger}"
+        )
+    linger_float = float(linger)
 
     def decorator(scalar_fn: Callable[..., Any]) -> Callable[..., Any]:
         execute = _build_executor(
@@ -457,6 +502,7 @@ def async_vmap_pool(
                     debug=debug,
                     label=getattr(scalar_fn, "__name__", ""),
                     coalescing=coalescing,
+                    linger=linger_float,
                 )
                 pools[loop] = pool
             return await pool.submit(*items)
