@@ -101,7 +101,7 @@ _QueueItem = Union[_Request, _Close]
 #: parked on the pool before the worker dispatches anyway. A safety valve so a
 #: task parked on non-pool work (a listener, an I/O loop, an unrelated sleep)
 #: can never starve a batch waiting for the "everyone is parked" condition.
-_SETTLE_TURNS = 5
+_SETTLE_TURNS = 10
 
 #: The pool never runs more than one batch at a time, so a single worker
 #: thread is all it can ever use.
