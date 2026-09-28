@@ -11,10 +11,13 @@ calls: only the *structure* and *leaf shapes* decide which requests may share
 a batch, never the values themselves. Two requests batch together exactly when
 stacking them is possible, so free-varying arguments cost nothing.
 
-Batching is *opportunistic*: the worker yields once to let other ready
-coroutines enqueue, drains whatever is already queued up to
-``max_batch_size``, and executes immediately. It never waits for a batch to
-fill, so a lone caller runs with no added latency.
+Batching is *coalescing*: the worker keeps the current batch open while
+concurrent callers keep arriving and dispatches it once the event loop has
+settled. ``coalescing="quiescent"`` (the default) waits  until every
+currently-runnable coroutine has had a turn and none enqueued more, so the
+whole burst runs as one batch; ``coalescing="opportunistic"`` yields once and
+dispatches whatever is queued. Either way a lone caller runs with no added
+latency, and a batch never grows past ``max_batch_size``.
 
 The pooling machinery is plain asyncio and knows nothing about JAX: it takes
 injected ``key`` and ``execute`` callables, which is what makes it testable on
@@ -82,6 +85,7 @@ class _Pool:
         loop: asyncio.AbstractEventLoop,
         debug: bool = False,
         label: str = "",
+        coalescing: str = "quiescent",
     ) -> None:
         self._execute = execute
         self._key = key
@@ -89,6 +93,7 @@ class _Pool:
         self._loop = loop
         self._debug = debug
         self._label = label
+        self._coalescing = coalescing
         self._queue: "asyncio.Queue[_Request]" = asyncio.Queue()
         self._task: Optional["asyncio.Task[None]"] = None
         self._pending: "set[asyncio.Future[Any]]" = set()
@@ -113,15 +118,42 @@ class _Pool:
         while True:
             request, future = await self._queue.get()
             batch: List[_Request] = [(request, future)]
+            if self._coalescing == "quiescent":
+                await self._collect_until_settled(batch)
+            else:
+                await self._collect_immediately(batch)
+            self._dispatch_grouped(batch)
 
-            # Yield once so other ready coroutines can enqueue, then take
-            # whatever is already queued. Deliberately no linger: waiting for
-            # more would add latency to every caller.
+    async def _collect_until_settled(self, batch: List[_Request]) -> None:
+        """Grow the batch until no other coroutine is ready to enqueue.
+
+        Each turn runs every currently-runnable coroutine, then the batch
+        takes whatever arrived. The batch is only dispatched once a full turn
+        adds nothing -- the event loop has settled -- or it is full. A lone
+        caller is alone in the loop, so the first turn adds nothing and it
+        runs with no added latency; a burst is all captured in one batch.
+        """
+        while len(batch) < self._max_batch_size:
             await asyncio.sleep(0)
+            grew = False
             while len(batch) < self._max_batch_size and not self._queue.empty():
                 batch.append(self._queue.get_nowait())
+                grew = True
+            if not grew:
+                return
 
-            self._dispatch_grouped(batch)
+    async def _collect_immediately(self, batch: List[_Request]) -> None:
+        """Yield once for ready callers, drain once, and execute right away.
+
+        The opportunistic mode: whatever is queued after a single turn is the
+        batch, and anything that enqueues a turn later starts its own batch.
+        """
+        # Yield once so other ready coroutines can enqueue, then take
+        # whatever is already queued. Deliberately no linger: waiting for
+        # more would add latency to every caller.
+        await asyncio.sleep(0)
+        while len(batch) < self._max_batch_size and not self._queue.empty():
+            batch.append(self._queue.get_nowait())
 
     def _dispatch_grouped(self, batch: List[_Request]) -> None:
         """Split the batch into compatible groups and execute each.
@@ -334,6 +366,7 @@ def _build_executor(
 def async_vmap_pool(
     max_batch_size: int,
     debug: bool = False,
+    coalescing: str = "quiescent",
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
 
@@ -359,6 +392,13 @@ def async_vmap_pool(
             function and the number of requests in that batch, plus a line
             whenever a new batch size is compiled. Useful for confirming that
             concurrent calls really are coalescing and that sizes are shared.
+        coalescing: How long the worker keeps a batch open while collecting.
+            ``"quiescent"`` (the default) waits until every currently-runnable
+            coroutine has had a turn and none enqueued more, so all batched
+            callers are captured by one execution; ``"opportunistic"`` yields
+            once and dispatches whatever is queued, so callers that arrive a
+            turn later run as their own batch. A lone caller runs with no
+            added latency under both.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -369,7 +409,8 @@ def async_vmap_pool(
 
     Raises:
         TypeError: If ``max_batch_size`` is not an ``int``.
-        ValueError: If ``max_batch_size`` is less than 1.
+        ValueError: If ``max_batch_size`` is less than 1, or ``coalescing``
+            is not ``"quiescent"`` or ``"opportunistic"``.
     """
     if not isinstance(max_batch_size, int):
         raise TypeError(
@@ -378,6 +419,11 @@ def async_vmap_pool(
     if max_batch_size < 1:
         raise ValueError(
             f"max_batch_size must be at least 1, got {max_batch_size}"
+        )
+    if coalescing not in ("quiescent", "opportunistic"):
+        raise ValueError(
+            "coalescing must be 'quiescent' or 'opportunistic', "
+            f"got {coalescing!r}"
         )
 
     def decorator(scalar_fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -410,6 +456,7 @@ def async_vmap_pool(
                     loop,
                     debug=debug,
                     label=getattr(scalar_fn, "__name__", ""),
+                    coalescing=coalescing,
                 )
                 pools[loop] = pool
             return await pool.submit(*items)

@@ -42,6 +42,82 @@ async def test_concurrent_calls_coalesce_into_one_batch():
     assert batches[0] == list(range(8))
 
 
+async def _staged_submit(pool, index):
+    """Submit ``index`` after ``index`` event-loop turns, one call per turn.
+
+    The callers reach the pool on successive turns (one arrival per turn, no
+    quiet gap), which is exactly the schedule where quiescent collecting and
+    opportunistic collecting differ.
+    """
+    for _ in range(index):
+        await asyncio.sleep(0)
+    return await pool.submit(index)
+
+
+@pytest.mark.asyncio
+async def test_quiescent_coalesces_calls_across_turns():
+    """By default the worker keeps collecting until no caller is runnable.
+
+    Callers that reach the pool on successive turns are all captured by the
+    one batch: the worker only dispatches once a full turn adds nothing.
+    """
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8)
+    results = await asyncio.gather(
+        *[_staged_submit(pool, i) for i in range(8)]
+    )
+
+    assert results == list(range(8))
+    assert sizes == [8]
+
+
+@pytest.mark.asyncio
+async def test_opportunistic_coalescing_splits_across_turns():
+    """``coalescing="opportunistic"`` dispatches after one turn.
+
+    Callers spread over successive turns do not wait for each other: the
+    worker takes whatever is queued after a single turn and executes, so the
+    trickle runs as several smaller batches.
+    """
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, coalescing="opportunistic")
+    results = await asyncio.gather(
+        *[_staged_submit(pool, i) for i in range(8)]
+    )
+
+    assert results == list(range(8))
+    assert sizes == [2, 2, 2, 2]
+
+
+@pytest.mark.asyncio
+async def test_max_batch_size_bounds_quiescent_collecting():
+    """Quiescent collecting never grows a batch past ``max_batch_size``."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=4)
+    results = await asyncio.gather(
+        *[_staged_submit(pool, i) for i in range(8)]
+    )
+
+    assert results == list(range(8))
+    assert max(sizes) <= 4
+    assert sum(sizes) == 8
+
+
 @pytest.mark.asyncio
 async def test_batch_never_exceeds_max_batch_size():
     sizes = []
@@ -256,6 +332,14 @@ def test_max_batch_size_must_be_an_int():
 def test_max_batch_size_must_be_positive():
     with pytest.raises(ValueError, match="at least 1"):
         async_vmap_pool(0)
+
+
+def test_coalescing_must_be_a_known_mode():
+    with pytest.raises(ValueError, match="coalescing must be"):
+        async_vmap_pool(8, coalescing="nope")
+    # Both documented modes are accepted.
+    async_vmap_pool(8, coalescing="quiescent")
+    async_vmap_pool(8, coalescing="opportunistic")
 
 
 @pytest.mark.asyncio

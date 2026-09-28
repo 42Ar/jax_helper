@@ -118,6 +118,16 @@ exactly when stacking them is possible. Requests that cannot share a `vmap`
 split into their own executions, so one odd shape costs an extra dispatch
 rather than failing everything queued alongside it.
 
+**Concurrent calls are coalesced.** The worker keeps the current batch open
+while callers keep arriving and dispatches it once the event loop has settled,
+so a burst of `await`s in one `asyncio.gather` runs as a single vectorised
+execution. `coalescing="quiescent"` (the default) waits until every
+currently-runnable coroutine has had a turn and none enqueued more — even a
+trickle arriving one call per turn is captured by one batch; 
+`coalescing="opportunistic"` yields once and runs whatever is queued, so a
+slow trickle is split into several batches. Either way a lone caller runs with
+no added latency, and no batch ever exceeds `max_batch_size`.
+
 Arguments and leaves inside a short batch are zero-padded up to the next
 power of two (never more than `max_batch_size`), then trimmed back to the real
 size. Because every argument is padded, the whole batch keeps a leading
@@ -174,8 +184,9 @@ silently.
 - **Everything is traced.** Values arrive as JAX tracers, so you cannot branch
   on them in Python. Use `jax.lax.cond` or similar, or capture the constant
   lexically in a closure factory if you need real Python control flow.
-- **Batching is opportunistic.** A lone caller runs immediately; the pool
-  yields once for other ready coroutines but never waits to fill a batch.
+- **Batching is opportunistic, not a guarantee.** A lone caller runs with no
+  added latency, and a batch never waits past the point where the event loop
+  has settled; callers that arrive later simply go in the next batch.
 
 ## Install
 
