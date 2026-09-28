@@ -169,15 +169,15 @@ async def test_batch_never_exceeds_max_batch_size():
 
 
 @pytest.mark.asyncio
-async def test_execution_runs_on_the_loop_thread_by_default():
-    """Without threading, batches execute inline in the worker task."""
+async def test_execution_runs_on_the_loop_thread_when_not_threaded():
+    """With ``threaded=False`` batches execute inline in the worker task."""
     thread_ids = []
 
     def execute(requests):
         thread_ids.append(threading.get_ident())
         return [request[0] for request in requests]
 
-    pool = _pool(execute)
+    pool = _pool(execute, threaded=False)
     await pool.submit(1)
     await pool.submit(2)
 
@@ -186,14 +186,14 @@ async def test_execution_runs_on_the_loop_thread_by_default():
 
 @pytest.mark.asyncio
 async def test_execution_runs_on_a_worker_thread():
-    """With ``threaded=True`` batches execute off the loop thread."""
+    """Batches execute off the event-loop thread by default."""
     thread_ids = []
 
     def execute(requests):
         thread_ids.append(threading.get_ident())
         return [request[0] for request in requests]
 
-    pool = _pool(execute, threaded=True)
+    pool = _pool(execute)
     await pool.submit(1)
     await pool.submit(2)
 
@@ -222,12 +222,12 @@ async def test_loop_stays_responsive_during_execution():
 
 @pytest.mark.asyncio
 async def test_loop_is_busy_during_inline_execution():
-    """By default a long batch holds the loop until it returns."""
+    """With the loop inline, a long batch holds the loop until it returns."""
     def execute(requests):
         time.sleep(0.05)
         return [request[0] for request in requests]
 
-    pool = _pool(execute)
+    pool = _pool(execute, threaded=False)
     start = time.perf_counter()
     task = asyncio.create_task(pool.submit(1))
     # An independent timer cannot run while the batch holds the loop.

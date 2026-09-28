@@ -21,12 +21,13 @@ concurrent calls -- even ones that reach the ``submit`` at different moments
 never grows past ``max_batch_size``, and a lone caller runs with no added
 latency: with no one else active, the first quiet turn dispatches it.
 
-By default each batch runs inline in the worker task, so the event loop is
-busy for the duration of the vectorised run. Pass ``run_in_thread=True`` to
-offload execution to a dedicated worker thread instead: NumPy and JAX release
-the GIL during their C compute, so the loop keeps servicing callers -- the
-ones becoming ready mid-batch submit straight into the next batch's queue --
-at the cost of one worker thread per pool.
+By default each batch runs on a dedicated worker thread, so the event loop is
+never frozen while NumPy or JAX compute runs; the GIL-releasing C work there
+lets the loop keep servicing callers -- the ones becoming ready mid-batch
+submit straight into the next batch's queue -- at the cost of one worker
+thread per pool. Pass ``run_in_thread=False`` to run the batch inline in the
+worker task instead: the loop is then busy for the duration of the run, but no
+thread is created and nothing crosses a thread boundary.
 
 The pooling machinery is plain asyncio and knows nothing about JAX: it takes
 injected ``key`` and ``execute`` callables, which is what makes it testable on
@@ -147,7 +148,7 @@ class _Pool:
         debug: bool = False,
         label: str = "",
         coalescing: str = "parked",
-        threaded: bool = False,
+        threaded: bool = True,
     ) -> None:
         self._execute = execute
         self._key = key
@@ -500,7 +501,7 @@ def async_vmap_pool(
     max_batch_size: int,
     debug: bool = False,
     coalescing: str = "parked",
-    run_in_thread: bool = False,
+    run_in_thread: bool = True,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
 
@@ -533,14 +534,14 @@ def async_vmap_pool(
             at slightly different moments -- runs as one ``vmap`` execution
             rather than one per arrival. A lone caller runs with no added
             latency.
-        run_in_thread: If True, execute each batch on a dedicated worker
-            thread (one thread per pool), so the event loop is never blocked
-            by the vectorised run; NumPy and JAX release the GIL during their
-            C compute, letting the loop keep servicing callers. If False (the
-            default), the batch runs inline in the worker task and the loop
-            is busy for the duration of the run, but no thread is created and
-            nothing crosses a thread boundary. The batch glue only passes
-            values in and out, so threading is safe either way.
+        run_in_thread: If True (the default), execute each batch on a dedicated
+            worker thread (one thread per pool), so the event loop is never
+            blocked by the vectorised run; NumPy and JAX release the GIL during
+            their C compute, letting the loop keep servicing callers. If False,
+            the batch runs inline in the worker task and the loop is busy for
+            the duration of the run, but no thread is created and nothing
+            crosses a thread boundary. The batch glue only passes values in and
+            out, so threading is safe either way.
 
     Returns:
         A decorator producing an async function that awaits to its result.
