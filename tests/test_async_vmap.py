@@ -933,7 +933,43 @@ async def test_debug_reports_when_the_settle_valve_fires(capsys):
 
     output = capsys.readouterr().err
     assert "pinned: dispatching after" in output
-    assert "a task was never parked on the pool" in output
+    assert "1 task(s) were not parked on the pool" in output
+    assert "background parked on Future" in output
+
+
+@pytest.mark.asyncio
+async def test_settle_message_names_each_unparked_task(capsys):
+    """Two stuck callers are both reported, each with its hold-up."""
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="pinned")
+
+    async def sleeper():
+        await asyncio.sleep(30)
+
+    s = asyncio.create_task(sleeper())
+
+    async def chaser():
+        await s  # parks on the sleeper task, not on the pool
+
+    async def blocker():
+        await asyncio.Event().wait()  # parks on a plain future
+
+    c = asyncio.create_task(chaser())
+    b = asyncio.create_task(blocker())
+    try:
+        assert await pool.submit("x") == "x"
+    finally:
+        for t in (s, c, b):
+            t.cancel()
+
+    output = capsys.readouterr().err
+    assert "3 task(s) were not parked on the pool" in output
+    assert "blocker parked on Future" in output
+    assert "sleeper parked on Future" in output
+    assert "chaser awaiting " in output
+    assert "sleeper" in output
 
 
 @pytest.mark.asyncio

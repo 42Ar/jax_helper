@@ -230,13 +230,18 @@ class _Pool:
             if idle_turns >= _SETTLE_TURNS:
                 # Safety valve: something stayed unparked (a listener, an I/O
                 # loop, a caller still computing) past the settle budget. In
-                # debug, say so -- it is how you spot the task the batch
-                # could have waited for.
+                # debug, say who and what they are parked on -- it is how you
+                # spot the task the batch could have waited for.
+                unparked = self._describe_unparked()
+                detail = (
+                    f"; {len(unparked)} task(s) were not parked on the pool: "
+                    + "; ".join(unparked)
+                ) if unparked else ""
                 _log(
                     self._label,
                     "dispatching after "
                     f"{_SETTLE_TURNS} idle turns with {len(batch)} "
-                    "request(s); a task was never parked on the pool",
+                    f"request(s){detail}",
                 )
                 return
 
@@ -262,7 +267,11 @@ class _Pool:
         return False
 
     def _all_parked(self) -> bool:
-        """True when no live task can enqueue without a batch executing first.
+        """True when no live task can enqueue without a batch executing first."""
+        return not self._unparked_tasks()
+
+    def _unparked_tasks(self) -> List["asyncio.Task[Any]"]:
+        """The live tasks that are not parked on this pool.
 
         A task is parked on this pool when the future it awaits is one of the
         futures handed out by :meth:`submit`. ``asyncio.Task._fut_waiter`` is
@@ -272,6 +281,7 @@ class _Pool:
         parks on an internal gathering future and cannot submit, and its
         children -- which park on pool futures directly -- already count.
         """
+        unparked: List["asyncio.Task[Any]"] = []
         for task in asyncio.all_tasks(self._loop):
             if task is self._task or task.done():
                 continue
@@ -283,8 +293,38 @@ class _Pool:
             ):
                 if self._gather_depends_on_pool(waiter):
                     continue
-            return False
-        return True
+            unparked.append(task)
+        return unparked
+
+    def _describe_unparked(self) -> List[str]:
+        """Name each unparked task and what it is currently parked on.
+
+        Future types are mostly opaque, so the practical clue is which
+        coroutine is involved and what its waiter is: a not-yet-started task,
+        another task being awaited, a ``gather`` over unrelated work, or a
+        future class. The names feed the settle-valve debug line.
+        """
+        descriptions: List[str] = []
+        for task in self._unparked_tasks():
+            coro = task.get_coro()
+            name = getattr(coro, "__qualname__", None) or f"task {task.get_name()}"
+            waiter = getattr(task, "_fut_waiter", None)
+            if waiter is None:
+                descriptions.append(f"{name} not started yet")
+            elif isinstance(waiter, asyncio.Task):
+                awaited = getattr(
+                    waiter.get_coro(), "__qualname__", "another task"
+                )
+                descriptions.append(f"{name} awaiting {awaited}")
+            elif _GATHERING_FUTURE is not None and isinstance(
+                waiter, _GATHERING_FUTURE
+            ):
+                descriptions.append(f"{name} awaiting an unrelated gather")
+            else:
+                descriptions.append(
+                    f"{name} parked on {type(waiter).__name__}"
+                )
+        return descriptions
 
     async def _dispatch_grouped(self, batch: List[_Request]) -> None:
         """Split the batch into compatible groups and execute each.
