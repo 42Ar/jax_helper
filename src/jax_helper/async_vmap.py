@@ -227,19 +227,20 @@ class _Pool:
         futures and nothing new is queued: at that point no request can reach
         the pool until a batch executes, so the batch is complete. A caller
         still computing is *not* parked, so it is waited for rather than
-        missed -- no turn-counting, no fixed linger. A batch is not dispatched
-        while it is below ``min_batch_size``, so a preference for full batches
-        holds until the safety valve gives up.
+        missed -- no turn-counting, no fixed linger. Every task being parked
+        dispatches the batch immediately, even one below ``min_batch_size``;
+        the minimum only shapes the compile on dispatch (a sub-minimum batch
+        runs padded up to it, never held waiting for more arrivals).
 
         Two safety valves bound the wait: the batch has reached
         ``max_batch_size`` -- which dispatches it immediately, with any
         overflow left queued to become the following (split) batch -- or the
         queue has been idle for up to ``_SETTLE_TURNS`` turns /
-        ``_SETTLE_TIMEOUT`` seconds while the batch is still below
-        ``min_batch_size`` or something is not parked on the pool. The latter
-        keeps a background task that parks on unrelated work (a listener, an
-        I/O loop) from starving the batch. Both budgets reset whenever a new
-        request arrives.
+        ``_SETTLE_TIMEOUT`` seconds while something has stayed unparked on the
+        pool. The latter keeps a background task that parks on unrelated work
+        (a listener, an I/O loop) from starving the batch; at that point the
+        batch dispatches with a ``min_batch_size`` note if it is below the
+        minimum. Both budgets reset whenever a new request arrives.
         """
         started = self._loop.time()
         idle_turns = 0
@@ -271,7 +272,7 @@ class _Pool:
                 idle_turns = 0
                 started = self._loop.time()
                 continue
-            if len(batch) >= self._min_batch_size and self._all_parked():
+            if self._all_parked():
                 return
             idle_turns += 1
             elapsed_ms = (self._loop.time() - started) * 1000.0
@@ -279,12 +280,11 @@ class _Pool:
                 idle_turns >= _SETTLE_TURNS
                 or elapsed_ms >= _SETTLE_TIMEOUT * 1000.0
             ):
-                # Safety valve: either something stayed unparked (a listener,
-                # an I/O loop, a caller still computing) or the batch is simply
-                # below ``min_batch_size``, and either the idle-turn budget or
-                # the wall-clock budget is spent. The line names the valve
-                # that tripped -- it is how you spot the task the batch could
-                # have waited for.
+                # Safety valve: something stayed unparked (a listener, an
+                # I/O loop, a caller still computing) and either the idle-turn
+                # budget or the wall-clock budget is spent. The line names the
+                # valve that tripped -- it is how you spot the task the batch
+                # could have waited for.
                 valve = []
                 if idle_turns >= _SETTLE_TURNS:
                     valve.append("idle-turn budget")

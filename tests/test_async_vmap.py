@@ -418,8 +418,7 @@ async def test_sub_min_batch_is_dispatched_whole_and_padded():
     pool = _pool(execute, max_batch_size=8, padding="down", min_batch_size=4)
     results = await asyncio.gather(*[pool.submit(i) for i in range(3)])
 
-    # floor(3) = 2 < min(4), so no split: one whole (padded) batch, reached
-    # via the settle valve after the below-min wait.
+    # floor(3) = 2 < min(4), so no split: one whole (padded) batch.
     assert results == list(range(3))
     assert sizes == [3]
 
@@ -443,8 +442,8 @@ async def test_padding_down_never_leaves_a_sub_min_tail():
 
 
 @pytest.mark.asyncio
-async def test_min_batch_size_holds_small_batches_then_dispatches():
-    """Below-min batches wait for the parked condition and the valve."""
+async def test_below_min_batch_dispatches_as_one_batch():
+    """A sub-minimum batch of parked callers dispatches as a single batch."""
     sizes = []
 
     def execute(requests):
@@ -456,6 +455,23 @@ async def test_min_batch_size_holds_small_batches_then_dispatches():
 
     assert results == [1, 2]
     assert sizes == [2]
+
+
+@pytest.mark.asyncio
+async def test_below_min_batch_dispatches_when_all_parked(capsys):
+    """All tasks parked dispatches below ``min_batch_size``, no valve wait."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, min_batch_size=4, debug=True)
+    results = await asyncio.gather(pool.submit(1), pool.submit(2))
+
+    assert results == [1, 2]
+    assert sizes == [2]
+    assert "dispatching after" not in capsys.readouterr().err
 
 
 @pytest.mark.asyncio

@@ -133,10 +133,9 @@ instead. A lone caller runs with no added latency, and no batch ever exceeds
 `max_batch_size`: the moment a batch fills to that cap it is dispatched
 immediately — not held for the parked condition — and a wave that overshoots
 the cap splits, running a full batch now and leaving the overflow queued for
-the next batch. With `min_batch_size` (default 1) a batch below the minimum
-is held for more arrivals until the settle valve gives up, and one that is
-still dispatched below it is padded up to the minimum rather than compiling a
-small shape.
+the next batch. With `min_batch_size` (default 1) a batch dispatched below
+the minimum is padded up to it rather than compiling a small shape; it is
+never held for future arrivals once every live task is parked on the pool.
 
 With `padding="up"` (the default), arguments and leaves inside a short batch
 are zero-padded up to the next power of two (never more than
