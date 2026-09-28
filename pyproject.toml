@@ -5,23 +5,28 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jax-helper"
 version = "0.1.0"
-description = "vmappable and jittable scalar root-finding routines for JAX"
+description = "Async scalar root-finding routines for pure Python"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 dependencies = [
-    "jax",
     "numpy",
-    "equinox",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-asyncio",
+    "pyright",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.10"
+reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

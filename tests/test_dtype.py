@@ -1,54 +1,55 @@
-import jax
-import jax.numpy as jnp
+import asyncio
 import numpy as np
 import pytest
 
 from jax_helper import bisection, brent, roots_scan
 
 
-@pytest.fixture(params=[False, True], ids=["float32", "float64"])
-def x64(request):
-    jax.config.update("jax_enable_x64", request.param)
+@pytest.fixture(params=[np.float32, np.float64], ids=["float32", "float64"])
+def dtype(request):
     return request.param
 
 
-def _atol():
-    return 1e-8 if jax.config.x64_enabled else 1e-4
+def _atol(dtype):
+    # The solver runs in float64, but a float32 ``f`` shifts the true root by
+    # ~1e-7, so the test tolerance must be set from ``f``'s precision.
+    return 1e-6 if dtype == np.float32 else 1e-9
 
-
-def _dtype():
-    return jnp.float64 if jax.config.x64_enabled else jnp.float32
-
-
-# --------------------------------------------------------------------------- #
-# Single-root solvers
-# --------------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("solver", [bisection, brent])
-def test_bracketed_cubic(x64, solver):
-    res = solver(lambda x: x**3 - 2.0, 0.0, 2.0, xtol=1e-5)
-    assert res.dtype == _dtype()
-    np.testing.assert_allclose(res, 2.0 ** (1.0 / 3.0), atol=1e-4)
+@pytest.mark.asyncio
+async def test_bracketed_cubic(dtype, solver):
+    async def f(x):
+        return dtype(x)**3 - dtype(2.0)
+    res = await solver(f, 0.0, 2.0, xtol=1e-12)
+    np.testing.assert_allclose(res, 2.0 ** (1.0 / 3.0), atol=_atol(dtype))
 
 
-# --------------------------------------------------------------------------- #
-# Sign-change scan
-# --------------------------------------------------------------------------- #
-
-def test_scan_cubic(x64):
-    res = roots_scan(lambda x: (x - 1) * (x - 2) * (x - 3), -1.0, 4.0, xtol=1e-5)
-    assert int(res.count) == 3
-    np.testing.assert_allclose(np.asarray(res.roots[:3]), [1.0, 2.0, 3.0], atol=_atol())
-
-
-def test_scan_boundaries(x64):
-    res = roots_scan(lambda x: x * (x - 1.0), 0.0, 1.0, xtol=1e-5)
-    assert int(res.count) == 2
-    np.testing.assert_allclose(np.asarray(res.roots[:2]), [0.0, 1.0], atol=_atol())
+@pytest.mark.asyncio
+async def test_scan_cubic(dtype):
+    async def f(x):
+        return (dtype(x) - 1) * (dtype(x) - 2) * (dtype(x) - 3)
+    res = await roots_scan(f, -1.0, 4.0, xtol=1e-12)
+    assert len(res) == 3
+    np.testing.assert_allclose(res[:3], [1.0, 2.0, 3.0], atol=_atol(dtype))
 
 
-def test_scan_vmap(x64):
-    g = lambda x, c: x**2 - c
-    cs = jnp.array([1.0, 4.0, 9.0])
-    res = jax.vmap(lambda c: roots_scan(g, -5.0, 5.0, args=(c,), xtol=1e-5))(cs)
-    assert np.all(np.asarray(res.count) == 2)
+@pytest.mark.asyncio
+async def test_scan_boundaries(dtype):
+    async def f(x):
+        return dtype(x) * (dtype(x) - dtype(1.0))
+    res = await roots_scan(f, 0.0, 1.0, xtol=1e-12)
+    assert len(res) == 2
+    np.testing.assert_allclose(res[:2], [0.0, 1.0], atol=_atol(dtype))
+
+
+@pytest.mark.asyncio
+async def test_scan_batched(dtype):
+    async def g(x, c):
+        return dtype(x)**2 - dtype(c)
+    cs = np.array([1.0, 4.0, 9.0], dtype=dtype)
+    results = await asyncio.gather(*[
+        roots_scan(g, -5.0, 5.0, args=(c,), xtol=1e-12) for c in cs
+    ])
+    for res in results:
+        assert len(res) == 2

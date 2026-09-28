@@ -1,642 +1,492 @@
-"""Scalar root-finding routines for JAX.
-
-Every routine here is written so that it composes cleanly with ``jax.jit``,
-``jax.vmap``, and ``jax.jvp``:
-
-* Iteration uses :func:`jax.lax.while_loop`, so it stops as soon as every
-  element has converged (returning the best estimate found).  This supports
-  forward-mode differentiation (:func:`jax.jvp`), but not reverse-mode
-  :func:`jax.grad`.
-* Each routine returns the root as a scalar array, or ``NaN`` if it did not
-  converge within ``maxiter`` iterations.
-* The callable ``f`` is invoked as ``f(x, *args)``, so extra arguments (e.g.
-  batched parameters) can be threaded through and vectorised with ``vmap``.
-
-Note on JIT: ``f`` (and ``df`` for :func:`newton`) are Python callables, not
-arrays, so when using ``jax.jit`` they must be closed over or marked static,
-e.g. ``jax.jit(lambda x0: newton(f, df, x0))``.
-
-Root finding is a fixed point; forward-mode differentiation differentiates the
-*converged iterate*.  For a smooth fixed point (Newton's method on a
-well-behaved function) this recovers the implicit-function-theorem derivative.
-See the test suite for an example.
-"""
+"""Scalar root-finding routines for pure Python with async support."""
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional, Tuple, Union
+import asyncio
+import math
+from typing import Any, Awaitable, Callable, Optional, Tuple, overload
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-from jax import lax
+
+#: A user callback: awaitable, returning a scalar.
+AsyncF = Callable[..., Awaitable[Any]]
 
 
-def bisection(
-    f: Callable[..., Any],
-    a: Any,
-    b: Any,
-    args: Tuple[Any, ...] = (),
-    xtol: float = 1e-5,
-    maxiter: int = 100,
-    fa: Any = None,
-    fb: Any = None,
-) -> Any:
-    """Find a root of ``f`` bracketed in ``[a, b]`` via the bisection method.
+def _wrap_f(f: AsyncF) -> Callable[..., Awaitable[float]]:
+    """Wrap an awaitable ``f`` so it returns a validated finite scalar.
 
-    Requires ``f(a)`` and ``f(b)`` to have opposite signs.  The interval is
-    halved each iteration, keeping the half where the sign changes; the
-    midpoint of the final bracket is returned, so the root is guaranteed to lie
-    within ``xtol`` of the true root whenever the sign condition holds.
-
-    Parameters
-    ----------
-    f : callable
-        Scalar-valued function to solve, called as ``f(x, *args)``.
-    a : array_like
-        Left endpoint of the bracketing interval.
-    b : array_like
-        Right endpoint of the bracketing interval.
-    args : tuple, optional
-        Extra positional arguments passed to ``f``.
-    xtol : float, optional
-        Absolute tolerance on the root's x-position (the bracket width
-        ``b - a``) for convergence.
-    maxiter : int, optional
-        Maximum number of iterations (a bound on the ``while_loop``).
-    fa : array_like, optional
-        Precomputed ``f(a, *args)``.  If omitted, it is evaluated here.
-    fb : array_like, optional
-        Precomputed ``f(b, *args)``.  If omitted, it is evaluated here.
-
-    Returns
-    -------
-    array_like
-        The root, or ``NaN`` if not converged.
-
-    Notes
-    -----
-    Bisection converges linearly and is guaranteed for any continuous ``f``
-    with a sign change on ``[a, b]``, but is slower than :func:`brent`.  The
-    routine is jittable, vmappable and supports forward-mode differentiation
-    (:func:`jax.jvp`), but not reverse-mode :func:`jax.grad`; when JIT-ing,
-    close over ``f``, e.g. ``jax.jit(lambda a, b: bisection(f, a, b))``.
-
-    See Also
-    --------
-    brent : Faster bracketed method.
-    newton, secant : Open (non-bracketed) methods.
+    Raises TypeError if the result is not a scalar, and ValueError if it is
+    not finite (``NaN`` or infinite).
     """
+    async def wrapper(x: Any, *args: Any) -> float:
+        y = await f(x, *args)
+        if np.ndim(y) != 0:
+            raise TypeError(f"f must return a scalar, got {type(y).__name__}")
+        y = float(y)
+        if not math.isfinite(y):
+            raise ValueError(f"f returned a non-finite value ({y!r}) at x = {x!r}")
+        return y
+    return wrapper
 
-    if fa is None:
-        fa = f(a, *args)
-    if fb is None:
-        fb = f(b, *args)
-    shape = jnp.shape(fa)
-    a = jnp.broadcast_to(a, shape)
-    b = jnp.broadcast_to(b, shape)
-    done0 = jnp.zeros(shape, dtype=jnp.bool_)
 
-    def cond(state: Tuple[Any, ...]) -> Any:
-        a, b, fa, fb, done, i = state
-        return jnp.any(~done) & (i < maxiter)
+def _require_tol(ftol: Optional[float], xtol: Optional[float]) -> None:
+    """Raise unless at least one convergence tolerance was supplied."""
+    if ftol is None and xtol is None:
+        raise ValueError("at least one of ftol or xtol must be given")
 
-    def body(state: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        a, b, fa, fb, done, i = state
+
+def _require_bracket(a: float, b: float) -> None:
+    """Raise unless ``[a, b]`` is a non-empty, correctly ordered interval.
+
+    An empty or reversed interval is a caller mistake, not a search outcome, so
+    it raises rather than reporting ``NaN``: every bracketed entry point in this
+    package shares this one check, and it runs before any callback is evaluated
+    so an invalid bracket costs nothing.
+    """
+    if not b > a:
+        raise ValueError(f"require a < b, got a={a!r}, b={b!r}")
+
+
+def _check_endpoint(value: Any, label: str) -> float:
+    """Validate a caller-supplied endpoint value as a finite scalar.
+
+    A precomputed ``fa``/``fb`` skips :func:`_wrap_f`, so it would otherwise be
+    the one way to hand a solver a value no callback could ever return.  Holding
+    them to the same rule keeps a single definition of a usable function value.
+    """
+    if np.ndim(value) != 0:
+        raise TypeError(f"{label} must be a scalar, got {type(value).__name__}")
+    y = float(value)
+    if not math.isfinite(y):
+        raise ValueError(f"{label} must be finite, got {y!r}")
+    return y
+
+
+@overload
+def _straddles_zero(f_a: float, f_b: float) -> bool: ...
+
+
+@overload
+def _straddles_zero(f_a: np.ndarray, f_b: np.ndarray) -> np.ndarray: ...
+
+
+def _straddles_zero(f_a: Any, f_b: Any) -> Any:
+    """True where two values straddle zero, in either order.
+
+    Comparing signs rather than ``f_a * f_b`` keeps the test valid at any
+    magnitude: the product underflows to zero for ``|f| < ~1e-162`` (hiding a
+    real sign change) and overflows for ``|f| > ~1e154``.  Either value being
+    exactly zero is not a straddle; callers report that as an exact root.
+    """
+    return (f_a != 0.0) & (f_b != 0.0) & ((f_a < 0.0) != (f_b < 0.0))
+
+
+def _is_root(f: float, ftol: Optional[float]) -> bool:
+    """True if ``f`` counts as a root: exactly zero, or within ``ftol`` of it.
+
+    Every function-value test in this module goes through here, so ``ftol``
+    means the same thing at a bracket's entry gate as it does inside the
+    iteration.  With no ``ftol`` this is an exact-zero test.
+
+    This is deliberately not used for derivatives, step denominators, or by
+    :func:`_straddles_zero`: a near-zero derivative or denominator is a
+    legitimate large step, not a root.
+    """
+    return f == 0.0 or (ftol is not None and abs(f) <= ftol)
+
+
+def _width_tol(x: float, xtol: Optional[float]) -> float:
+    """Step width that is indistinguishable from zero, measured near ``x``.
+
+    This is the single definition of what ``xtol`` means: a distance in ``x``
+    that the arithmetic cannot meaningfully resolve.  The machine-precision
+    term keeps a near-coincident pair of iterates from looping forever once they
+    are adjacent floats, so ``xtol=0.0`` means "as exact as the arithmetic
+    allows" rather than "impossible", uniformly across every solver.
+
+    :func:`_brent` uses half of this, which is the half-width ``xm = 0.5 * (c - b)``
+    it actually tests.
+    """
+    eps = float(np.finfo(np.float64).eps)
+    return 4.0 * eps * abs(x) + (xtol if xtol is not None else 0.0)
+
+
+def _gate(
+    f_a: float, f_b: float, a: float, b: float, ftol: Optional[float]
+) -> Optional[float]:
+    """What a bracketed solver should report without iterating, if anything.
+
+    Returns the endpoint to report when it already counts as a root under
+    ``ftol``, ``NaN`` when the bracket provably holds no root, and ``None`` to
+    signal that the solver must iterate.  Both bracketed solvers share this so
+    their entry conditions cannot drift apart.
+    """
+    if _is_root(f_a, ftol) or _is_root(f_b, ftol):
+        # if only one endpoint qualifies it necessarily has the smaller |f|;
+        # if both do, the better root wins
+        return a if abs(f_a) <= abs(f_b) else b
+    if not _straddles_zero(f_a, f_b):
+        return float("nan")
+    return None
+
+
+async def _bisect(
+    g: Callable[..., Awaitable[float]],
+    a: float,
+    b: float,
+    args: Tuple[Any, ...],
+    ftol: Optional[float],
+    xtol: Optional[float],
+    maxiter: int,
+    f_a: float,
+    f_b: float,
+) -> float:
+    """Bisection core; ``g`` must already be wrapped by :func:`_wrap_f`."""
+    gate = _gate(f_a, f_b, a, b, ftol)
+    if gate is not None:
+        return gate
+    for _ in range(maxiter):
         c = 0.5 * (a + b)
-        fc = f(c, *args)
-        same_sign = fa * fc > 0
-        a = jnp.where(same_sign, c, a)
-        b = jnp.where(same_sign, b, c)
-        fa = jnp.where(same_sign, fc, fa)
-        fb = jnp.where(same_sign, fb, fc)
-        converged = jnp.isnan(fa) | jnp.isnan(fb) | (b - a <= xtol)
-        done = done | converged
-        return a, b, fa, fb, done, i + 1
-
-    a, b, fa, fb, done, i = lax.while_loop(cond, body, (a, b, fa, fb, done0, 0))
-    root = 0.5 * (a + b)
-    ok = (b - a <= xtol) & ~jnp.isnan(fa) & ~jnp.isnan(fb)
-    return jnp.where(ok, root, jnp.nan)
+        if xtol is not None and abs(b - a) <= _width_tol(c, xtol):
+            return c
+        f_c = await g(c, *args)
+        if _is_root(f_c, ftol):
+            return c
+        if (f_a < 0.0) == (f_c < 0.0):
+            a, f_a = c, f_c
+        else:
+            b = c
+    return float("nan")
 
 
-def newton(
-    f: Callable[..., Any],
-    df: Callable[..., Any],
-    x0: Any,
+async def _endpoints(
+    g: Callable[..., Awaitable[float]],
+    a: float,
+    b: float,
+    args: Tuple[Any, ...],
+    f_a: Optional[float],
+    f_b: Optional[float],
+) -> Tuple[float, float]:
+    """Return the bracket's endpoint values, evaluating only the missing ones.
+
+    The two endpoints are independent, so they are evaluated concurrently.  A
+    caller that already holds one or both values (e.g. :func:`roots_scan`, which
+    sampled the grid) pays for none of them.  Supplied values are validated by
+    :func:`_check_endpoint` first, so they are held to the same rule as
+    evaluated ones.
+    """
+    known_a = _check_endpoint(f_a, "fa") if f_a is not None else None
+    known_b = _check_endpoint(f_b, "fb") if f_b is not None else None
+    if known_a is not None and known_b is not None:
+        return known_a, known_b
+    missing = [x for x, known in ((a, known_a), (b, known_b)) if known is None]
+    values = iter([float(v) for v in await asyncio.gather(*[g(x, *args) for x in missing])])
+    return (
+        next(values) if known_a is None else known_a,
+        next(values) if known_b is None else known_b,
+    )
+
+
+async def bisection(
+    f: AsyncF,
+    a: float,
+    b: float,
+    args: Tuple[Any, ...] = (),
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
+    maxiter: int = 100,
+    fa: Optional[float] = None,
+    fb: Optional[float] = None,
+) -> float:
+    """Find a root of ``f`` bracketed in ``[a, b]`` via bisection.
+
+    Requires ``a < b``; an empty or reversed interval raises ``ValueError``
+    before any evaluation.  A bracket endpoint already within ``ftol`` of zero
+    is returned as the root before any iteration.  Otherwise each step halves the
+    bracket and stops once ``|f(x)| <= ftol``, returning the midpoint, or once
+    the bracket width is ``<= xtol`` (plus machine precision), also returning the
+    midpoint.  On the ``ftol`` stop the midpoint is the best available point,
+    since both endpoints are already known to be outside ``ftol``.  At least one
+    of the two tolerances is required.  Returns the root, or ``NaN`` if no point
+    in the bracket is within ``ftol`` of a root and no sign change is bracketed,
+    or if ``maxiter`` is exhausted.
+    """
+    _require_tol(ftol, xtol)
+    a, b = float(a), float(b)
+    _require_bracket(a, b)
+    g = _wrap_f(f)
+    f_a, f_b = await _endpoints(g, a, b, args, fa, fb)
+    return await _bisect(g, a, b, args, ftol, xtol, maxiter, f_a, f_b)
+
+
+async def _newton(
+    g: Callable[..., Awaitable[float]],
+    dg: Callable[..., Awaitable[float]],
+    x: float,
+    args: Tuple[Any, ...],
+    ftol: Optional[float],
+    xtol: Optional[float],
+    maxiter: int,
+) -> float:
+    """Newton core; ``g`` and ``dg`` must already be wrapped by :func:`_wrap_f`."""
+    fx = await g(x, *args)
+    for i in range(maxiter):
+        if _is_root(fx, ftol):
+            return x
+        d = await dg(x, *args)
+        if d == 0:
+            return float("nan")
+        step = fx / d
+        if xtol is not None and abs(step) <= _width_tol(x, xtol):
+            return x
+        x -= step
+        if not math.isfinite(x):
+            # a diverging iterate is never a root, and evaluating f there would
+            # overflow a user's function into a ValueError instead of NaN
+            return float("nan")
+        if i + 1 == maxiter:
+            # f(x) would only be read by the check at the top of another
+            # iteration, so evaluating it now would be wasted work.
+            break
+        fx = await g(x, *args)
+    return float("nan")
+
+
+async def newton(
+    f: AsyncF,
+    df: AsyncF,
+    x0: float,
     args: Tuple[Any, ...] = (),
     ftol: Optional[float] = None,
     xtol: Optional[float] = None,
     maxiter: int = 50,
-) -> Any:
-    """Find a root of a scalar function via the Newton-Raphson method.
+) -> float:
+    """Find a root via Newton-Raphson iteration.
 
-    Iterates ``x_{k+1} = x_k - f(x_k) / f'(x_k)`` from the initial guess
-    ``x0``.  The derivative ``df`` must be supplied (it may be obtained with
-    :func:`jax.grad`).  Convergence is declared when ``|f(x)| <= ftol`` or, if
-    ``xtol`` is given, when the step ``|x_{k+1} - x_k| <= xtol``.
-
-    Parameters
-    ----------
-    f : callable
-        Scalar-valued function to solve, called as ``f(x, *args)``.
-    df : callable
-        Derivative of ``f`` with respect to its first argument, called as
-        ``df(x, *args)``.
-    x0 : array_like
-        Initial guess.
-    args : tuple, optional
-        Extra positional arguments passed to ``f`` and ``df``.
-    ftol : float, optional
-        Absolute tolerance on ``|f(x)|`` for convergence.  Defaults to a few
-        hundred times machine epsilon.
-    xtol : float, optional
-        Absolute tolerance on the root's x-position (the step size
-        ``|x_{k+1} - x_k|``).  Opt-in: ``None`` disables this criterion.
-    maxiter : int, optional
-        Maximum number of iterations (a bound on the ``while_loop``).
-
-    Returns
-    -------
-    array_like
-        The root, or ``NaN`` if not converged.
-
-    Notes
-    -----
-    Newton's method converges quadratically near a simple root but only
-    locally; provide a good initial guess, or use a bracketed method
-    (:func:`bisection`, :func:`brent`) for global convergence.  A zero
-    derivative is guarded by leaving the iterate unchanged.
-
-    The iteration uses :func:`jax.lax.while_loop`, so it stops as soon as
-    every element has converged (no further ``f``/``df`` evaluations).  It is
-    jittable and vmappable, and supports forward-mode differentiation
-    (:func:`jax.jvp`), but not reverse-mode :func:`jax.grad`.  When JIT-ing,
-    close over ``f`` and ``df``, e.g. ``jax.jit(lambda x0: newton(f, df, x0))``.
-
-    See Also
-    --------
-    secant : Derivative-free alternative.
-    bisection, brent : Bracketed, global-convergence methods.
+    Stops once ``|f(x)| <= ftol`` or the step is ``<= xtol`` (plus machine
+    precision), returning the point the solver is standing on.  At least one of
+    the two tolerances is required.  Returns the root, or ``NaN`` if ``df``
+    vanishes at the iterate, if an iterate becomes non-finite, or if ``maxiter``
+    is exhausted.
     """
-
-    fx0 = f(x0, *args)
-    if ftol is None:
-        ftol = float(100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps)
-    x = jnp.broadcast_to(x0, jnp.shape(fx0))
-    dx = jnp.full_like(x, jnp.inf)
-
-    def cond(state: Tuple[Any, Any, Any, Any]) -> Any:
-        x, fx, dx, i = state
-        done = jnp.isnan(fx) | (jnp.abs(fx) <= ftol)
-        if xtol is not None:
-            done = done | (dx <= xtol)
-        return jnp.any(~done) & (i < maxiter)
-
-    def body(state: Tuple[Any, Any, Any, Any]) -> Tuple[Any, Any, Any, Any]:
-        x, fx, dx, i = state
-        d = df(x, *args)
-        step = jnp.where(d == 0, 0.0, fx / d)
-        x = x - step
-        dx = jnp.where(d == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))  # pyright: ignore[reportArgumentType]
-        return x, f(x, *args), dx, i + 1
-
-    x, fx, dx, i = lax.while_loop(cond, body, (x, fx0, dx, 0))
-    converged = jnp.abs(fx) <= ftol
-    if xtol is not None:
-        converged = converged | (dx <= xtol)  # pyright: ignore[reportOperatorIssue]
-    return jnp.where(converged, x, jnp.nan)
+    _require_tol(ftol, xtol)
+    return await _newton(_wrap_f(f), _wrap_f(df), float(x0), args, ftol, xtol, maxiter)
 
 
-def steffensen(
-    f: Callable[..., Any],
-    x0: Any,
+async def _steffensen(
+    g: Callable[..., Awaitable[float]],
+    x: float,
+    args: Tuple[Any, ...],
+    ftol: Optional[float],
+    xtol: Optional[float],
+    maxiter: int,
+    slope: float,
+) -> float:
+    """Steffensen core; ``g`` must already be wrapped by :func:`_wrap_f`."""
+    fx = await g(x, *args)
+    for i in range(maxiter):
+        if _is_root(fx, ftol):
+            return x
+        probe = x + fx / slope
+        if probe == x:
+            return x
+        if not math.isfinite(probe):
+            return float("nan")
+        denom = await g(probe, *args) - fx
+        if denom == 0.0:
+            return float("nan")
+        step = fx * fx / (slope * denom)
+        if xtol is not None and abs(step) <= _width_tol(x, xtol):
+            return x
+        x -= step
+        if not math.isfinite(x):
+            return float("nan")
+        if i + 1 == maxiter:
+            # See _newton(): the next f(x) would go unread.
+            break
+        fx = await g(x, *args)
+    return float("nan")
+
+
+async def steffensen(
+    f: AsyncF,
+    x0: float,
     args: Tuple[Any, ...] = (),
     ftol: Optional[float] = None,
     xtol: Optional[float] = None,
     maxiter: int = 50,
     slope: float = 1.0,
-) -> Any:
-    """Find a root of a scalar function via Steffensen's method.
+) -> float:
+    """Find a root via Steffensen's method (derivative-free).
 
-    A derivative-free analogue of Newton's method with quadratic convergence.
-    It approximates ``f'(x)`` by a one-sided finite difference with step
-    ``h = f(x) / slope`` and iterates ``x_{k+1} = x_k - f(x_k)^2 /
-    (slope * (f(x_k + f(x_k)/slope) - f(x_k)))``, so only ``f`` (never its
-    derivative) is evaluated.  Convergence is declared when ``|f(x)| <= ftol``
-    or, if ``xtol`` is given, when the step ``|x_{k+1} - x_k| <= xtol``.
-
-    Parameters
-    ----------
-    f : callable
-        Scalar-valued function to solve, called as ``f(x, *args)``.
-    x0 : array_like
-        Initial guess.
-    args : tuple, optional
-        Extra positional arguments passed to ``f``.
-    ftol : float, optional
-        Absolute tolerance on ``|f(x)|`` for convergence.  Defaults to a few
-        hundred times machine epsilon.
-    xtol : float, optional
-        Absolute tolerance on the root's x-position (the step size).  Opt-in:
-        ``None`` disables this criterion.
-    maxiter : int, optional
-        Maximum number of iterations (a bound on the ``while_loop``).
-    slope : float, optional
-        A characteristic slope of ``f`` (an estimate of ``|f'|``, in units of
-        ``f`` per unit of ``x``).  It rescales the finite-difference step
-        ``f(x)/slope`` into x-units; the default ``1.0`` recovers textbook
-        Steffensen.  Must be nonzero.
-
-    Returns
-    -------
-    array_like
-        The root, or ``NaN`` if not converged.
-
-    Notes
-    -----
-    Steffensen's method requires no derivative and converges quadratically
-    near a simple root, making it useful when ``f'`` is unavailable or
-    expensive to compute.  A zero denominator is guarded by leaving the
-    iterate unchanged.  The iteration uses :func:`jax.lax.while_loop`, so it
-    stops as soon as every element has converged; it is jittable and vmappable
-    but not reverse-mode differentiable.
-
-    See Also
-    --------
-    newton : Derivative-based method with the same convergence rate.
-    secant : Another derivative-free method (requires two starting points).
-    bisection, brent : Bracketed, global-convergence methods.
+    Stops once ``|f(x)| <= ftol`` or the step is ``<= xtol`` (plus machine
+    precision), returning the point the solver is standing on.  ``slope``
+    rescales the finite-difference probe.  At least one of the two tolerances is
+    required.  Returns the root, or ``NaN`` if the step's denominator vanishes,
+    if an iterate becomes non-finite, or if ``maxiter`` is exhausted.
     """
-
-    fx0 = f(x0, *args)
-    if ftol is None:
-        ftol = float(100.0 * jnp.finfo(jnp.asarray(fx0).dtype).eps)
-    x = jnp.broadcast_to(x0, jnp.shape(fx0))
-    dx = jnp.full_like(x, jnp.inf)
-
-    def cond(state: Tuple[Any, Any, Any, Any]) -> Any:
-        x, fx, dx, i = state
-        done = jnp.isnan(fx) | (jnp.abs(fx) <= ftol)
-        if xtol is not None:
-            done = done | (dx <= xtol)
-        return jnp.any(~done) & (i < maxiter)
-
-    def body(state: Tuple[Any, Any, Any, Any]) -> Tuple[Any, Any, Any, Any]:
-        x, fx, dx, i = state
-        denom = f(x + fx / slope, *args) - fx
-        step = jnp.where(denom == 0, 0.0, fx * fx / (slope * denom))
-        x = x - step
-        dx = jnp.where(denom == 0, jnp.full_like(x, jnp.inf), jnp.abs(step))  # pyright: ignore[reportArgumentType]
-        return x, f(x, *args), dx, i + 1
-
-    x, fx, dx, i = lax.while_loop(cond, body, (x, fx0, dx, 0))
-    converged = jnp.abs(fx) <= ftol
-    if xtol is not None:
-        converged = converged | (dx <= xtol)  # pyright: ignore[reportOperatorIssue]
-    return jnp.where(converged, x, jnp.nan)
+    _require_tol(ftol, xtol)
+    return await _steffensen(
+        _wrap_f(f), float(x0), args, ftol, xtol, maxiter, float(slope)
+    )
 
 
-def secant(
-    f: Callable[..., Any],
-    x0: Any,
-    x1: Any,
+async def _secant(
+    g: Callable[..., Awaitable[float]],
+    x0: float,
+    x1: float,
+    args: Tuple[Any, ...],
+    ftol: Optional[float],
+    xtol: Optional[float],
+    maxiter: int,
+) -> float:
+    """Secant core; ``g`` must already be wrapped by :func:`_wrap_f`."""
+    f0, f1 = await asyncio.gather(g(x0, *args), g(x1, *args))
+    for i in range(maxiter):
+        if _is_root(f1, ftol):
+            return x1
+        denom = f1 - f0
+        if denom == 0:
+            return float("nan")
+        x2 = x1 - f1 * (x1 - x0) / denom
+        if not math.isfinite(x2):
+            return float("nan")
+        if xtol is not None and abs(x2 - x1) <= _width_tol(x1, xtol):
+            # f(x2) would only be read by the next iteration, which cannot use
+            # it now that we have stopped, so it is not evaluated at all
+            return x1
+        if i + 1 == maxiter:
+            # same reasoning as the xtol stop above, one step later: f2 would
+            # land in f1 and be read by nothing, since the loop is over
+            break
+        f2 = await g(x2, *args)
+        x0, x1 = x1, x2
+        f0, f1 = f1, f2
+    return float("nan")
+
+
+async def secant(
+    f: AsyncF,
+    x0: float,
+    x1: float,
     args: Tuple[Any, ...] = (),
     ftol: Optional[float] = None,
     xtol: Optional[float] = None,
     maxiter: int = 50,
-) -> Any:
-    """Find a root of a scalar function via the secant method.
+) -> float:
+    """Find a root via the secant method.
 
-    Uses two starting points ``x0`` and ``x1`` and the recurrence
-    ``x_{k+1} = x_k - f(x_k) (x_k - x_{k-1}) / (f(x_k) - f(x_{k-1}))``.  No
-    derivative is required.  Convergence is declared when ``|f(x)| <= ftol`` or,
-    if ``xtol`` is given, when the step ``|x_{k+1} - x_k| <= xtol``.
-
-    Parameters
-    ----------
-    f : callable
-        Scalar-valued function to solve, called as ``f(x, *args)``.
-    x0 : array_like
-        First initial guess.
-    x1 : array_like
-        Second initial guess.
-    args : tuple, optional
-        Extra positional arguments passed to ``f``.
-    ftol : float, optional
-        Absolute tolerance on ``|f(x)|`` for convergence.  Defaults to a few
-        hundred times machine epsilon.
-    xtol : float, optional
-        Absolute tolerance on the root's x-position (the step size).  Opt-in:
-        ``None`` disables this criterion.
-    maxiter : int, optional
-        Maximum number of iterations (a bound on the ``while_loop``).
-
-    Returns
-    -------
-    array_like
-        The root, or ``NaN`` if not converged.
-
-    Notes
-    -----
-    The secant method has superlinear convergence (order ~1.618) and is
-    derivative-free, but may stall when ``f(x_k) ≈ f(x_{k-1})`` (guarded by
-    leaving the iterate unchanged).  The routine is jittable, vmappable and
-    supports forward-mode differentiation (:func:`jax.jvp`), but not
-    reverse-mode :func:`jax.grad`; when JIT-ing, close over ``f``.
-
-    See Also
-    --------
-    newton : Faster, derivative-based method.
-    bisection, brent : Bracketed, global-convergence methods.
+    Stops once ``|f(x)| <= ftol`` or the step is ``<= xtol`` (plus machine
+    precision), returning the point the solver is standing on rather than the
+    step it just proposed, so a stop never spends an extra evaluation.  At least
+    one of the two tolerances is required.  Returns the root, or ``NaN`` if the
+    step's denominator vanishes, if an iterate becomes non-finite, or if
+    ``maxiter`` is exhausted.
     """
-
-    f0 = f(x0, *args)
-    f1 = f(x1, *args)
-    if ftol is None:
-        ftol = float(100.0 * jnp.finfo(jnp.asarray(f0).dtype).eps)
-    shape = jnp.shape(f0)
-    x0 = jnp.broadcast_to(x0, shape)
-    x1 = jnp.broadcast_to(x1, shape)
-    done0 = jnp.zeros(shape, dtype=jnp.bool_)
-
-    def cond(state: Tuple[Any, ...]) -> Any:
-        x0, x1, f0, f1, done, i = state
-        return jnp.any(~done) & (i < maxiter)
-
-    def body(state: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        x0, x1, f0, f1, done, i = state
-        denom = f1 - f0
-        x2 = jnp.where(denom == 0, x1, x1 - f1 * (x1 - x0) / denom)
-        f2 = f(x2, *args)
-        converged = jnp.isnan(f1) | (jnp.abs(f1) <= ftol)
-        if xtol is not None:
-            converged = converged | (jnp.abs(x2 - x1) <= xtol)  # pyright: ignore[reportOperatorIssue]
-        done = done | converged
-        return x1, x2, f1, f2, done, i + 1
-
-    x0, x1, f0, f1, done, i = lax.while_loop(cond, body, (x0, x1, f0, f1, done0, 0))
-    converged = jnp.abs(f1) <= ftol
-    if xtol is not None:
-        converged = converged | (jnp.abs(x1 - x0) <= xtol)  # pyright: ignore[reportOperatorIssue]
-    return jnp.where(converged, x1, jnp.nan)
+    _require_tol(ftol, xtol)
+    return await _secant(
+        _wrap_f(f), float(x0), float(x1), args, ftol, xtol, maxiter
+    )
 
 
-def brent(
-    f: Callable[..., Any],
-    a: Any,
-    b: Any,
+async def _brent(
+    g: Callable[..., Awaitable[float]],
+    a: float,
+    b: float,
+    args: Tuple[Any, ...],
+    ftol: Optional[float],
+    xtol: Optional[float],
+    maxiter: int,
+    f_a: float,
+    f_b: float,
+) -> float:
+    """Brent core; ``g`` must already be wrapped by :func:`_wrap_f`."""
+    gate = _gate(f_a, f_b, a, b, ftol)
+    if gate is not None:
+        return gate
+    c, f_c = b, f_b
+    d = e = 0.0
+    for i in range(maxiter):
+        # f(b) and f(c) same sign: drop the oldest point, reset c to a.
+        if (f_b > 0.0) == (f_c > 0.0):
+            c, f_c = a, f_a
+            d = e = b - a
+        # Keep |f(b)| <= |f(c)|: b is the best estimate.
+        if abs(f_c) < abs(f_b):
+            a, f_a = b, f_b
+            b, f_b = c, f_c
+            c, f_c = a, f_a
+        if _is_root(f_b, ftol):
+            return b
+        # half of the width tolerance: xm is a half-width, and the rest of the
+        # algorithm below is Brent's, which is parameterised by this value
+        tol1 = 0.5 * _width_tol(b, xtol)
+        xm = 0.5 * (c - b)
+        if abs(xm) <= tol1:
+            return b
+        if abs(e) >= tol1 and abs(f_a) > abs(f_b):
+            # Try secant (a == c) or inverse quadratic interpolation.
+            s = f_b / f_a
+            if a == c:
+                p = 2.0 * xm * s
+                q = 1.0 - s
+            else:
+                q = f_a / f_c
+                r = f_b / f_c
+                p = s * (2.0 * xm * q * (q - r) - (b - a) * (r - 1.0))
+                q = (q - 1.0) * (r - 1.0) * (s - 1.0)
+            if p > 0.0:
+                q = -q
+            p = abs(p)
+            if 2.0 * p < min(3.0 * xm * q - abs(tol1 * q), abs(e * q)):
+                e = d
+                d = p / q
+            else:
+                d = xm
+                e = d
+        else:
+            d = xm
+            e = d
+        a, f_a = b, f_b
+        if abs(d) > tol1:
+            b += d
+        else:
+            b += tol1 if xm >= 0 else -tol1
+        if i + 1 == maxiter:
+            # f(b) would only be read by the next iteration's bookkeeping,
+            # which never runs, so evaluating it now would be wasted work.
+            break
+        f_b = await g(b, *args)
+    return float("nan")
+
+
+async def brent(
+    f: AsyncF,
+    a: float,
+    b: float,
     args: Tuple[Any, ...] = (),
-    xtol: float = 1e-5,
+    ftol: Optional[float] = None,
+    xtol: Optional[float] = None,
     maxiter: int = 100,
-    fa: Any = None,
-    fb: Any = None,
-) -> Any:
+    fa: Optional[float] = None,
+    fb: Optional[float] = None,
+) -> float:
     """Find a root of ``f`` bracketed in ``[a, b]`` via Brent's method.
 
-    Requires ``f(a)`` and ``f(b)`` to have opposite signs.  Brent's method
-    combines bisection with inverse quadratic interpolation and the secant
-    method, falling back to bisection whenever the interpolation step would be
-    unsafe; this gives robust, fast convergence on smooth functions.
-
-    Parameters
-    ----------
-    f : callable
-        Scalar-valued function to solve, called as ``f(x, *args)``.
-    a : array_like
-        Left endpoint of the bracketing interval.
-    b : array_like
-        Right endpoint of the bracketing interval.
-    args : tuple, optional
-        Extra positional arguments passed to ``f``.
-    xtol : float, optional
-        Absolute tolerance on the root's x-position (the bracket width) for
-        convergence.
-    maxiter : int, optional
-        Maximum number of iterations (a bound on the ``while_loop``).
-    fa : array_like, optional
-        Precomputed ``f(a, *args)``.  If omitted, it is evaluated here.
-    fb : array_like, optional
-        Precomputed ``f(b, *args)``.  If omitted, it is evaluated here.
-
-    Returns
-    -------
-    array_like
-        The root, or ``NaN`` if not converged.
-
-    Notes
-    -----
-    Brent's method is the recommended general-purpose bracketed solver: it
-    converges at least as fast as bisection and typically much faster, while
-    never leaving the bracketing interval.  The routine is jittable, vmappable
-    and supports forward-mode differentiation (:func:`jax.jvp`), but not
-    reverse-mode :func:`jax.grad`; when JIT-ing, close over ``f``.
-
-    See Also
-    --------
-    bisection : Simpler bracketed method.
-    newton, secant : Open (non-bracketed) methods.
+    Requires ``a < b``; an empty or reversed interval raises ``ValueError``
+    before any evaluation.  Combines inverse quadratic interpolation and the
+    secant method with a bisection fallback.  Invariant: ``b`` is the best
+    estimate and ``f(b)`` has opposite sign to ``f(c)``.  A bracket endpoint
+    already within ``ftol`` of zero is returned as the root before any iteration.
+    Otherwise it stops once ``|f(b)| <= ftol`` or the bracket is within ``xtol``
+    (plus machine precision), returning ``b`` either way.  At least one of the
+    two tolerances is required.  Returns the root, or ``NaN`` if no point in the
+    bracket is within ``ftol`` of a root and no sign change is bracketed, or if
+    ``maxiter`` is exhausted.
     """
-
-    if fa is None:
-        fa = f(a, *args)
-    if fb is None:
-        fb = f(b, *args)
-    shape = jnp.shape(fa)
-    a = jnp.broadcast_to(a, shape)
-    b = jnp.broadcast_to(b, shape)
-    zero = jnp.zeros(shape)
-    done0 = jnp.zeros(shape, dtype=jnp.bool_)
-
-    def cond(state: Tuple[Any, ...]) -> Any:
-        *_, done, i = state
-        return jnp.any(~done) & (i < maxiter)
-
-    def body(state: Tuple[Any, ...]) -> Tuple[Any, ...]:
-        pre, cur, blk, fpre, fcur, fblk, spre, scur, done, i = state
-
-        # Maintain the most recent bracket: if the last two points bracket a
-        # root, record them.
-        has_sign = fpre * fcur < 0
-        blk = jnp.where(has_sign, pre, blk)
-        fblk = jnp.where(has_sign, fpre, fblk)
-        spre = jnp.where(has_sign, cur - pre, spre)
-        scur = jnp.where(has_sign, cur - pre, scur)
-
-        # Swap so ``cur`` is the point with the smaller |f|.  The swap is
-        # sequential (as in scipy's brentq), leaving ``pre`` and ``blk`` equal.
-        swap = jnp.abs(fblk) < jnp.abs(fcur)
-        new_pre = jnp.where(swap, cur, pre)
-        new_cur = jnp.where(swap, blk, cur)
-        new_blk = jnp.where(swap, cur, blk)
-        new_fpre = jnp.where(swap, fcur, fpre)
-        new_fcur = jnp.where(swap, fblk, fcur)
-        new_fblk = jnp.where(swap, fcur, fblk)
-        pre, cur, blk = new_pre, new_cur, new_blk
-        fpre, fcur, fblk = new_fpre, new_fcur, new_fblk
-
-        delta = 0.5 * xtol
-        sbis = 0.5 * (blk - cur)
-        converged = jnp.isnan(fcur) | (fcur == 0.0) | (jnp.abs(sbis) < delta)
-
-        # Choose between inverse quadratic interpolation, secant, and bisection.
-        use_interp = (jnp.abs(spre) > delta) & (jnp.abs(fcur) < jnp.abs(fpre))
-        is_secant = pre == blk
-
-        dpre = jnp.where(pre == cur, 0.0, (fpre - fcur) / (pre - cur))
-        dblk = jnp.where(blk == cur, 0.0, (fblk - fcur) / (blk - cur))
-        stry_quad = -fcur * (fblk * dblk - fpre * dpre) / (dblk * dpre * (fblk - fpre))  # pyright: ignore[reportOperatorIssue, reportArgumentType]
-        stry_secant = jnp.where(fcur == fpre, 0.0, -fcur * (cur - pre) / (fcur - fpre))
-        stry = jnp.where(is_secant, stry_secant, stry_quad)  # pyright: ignore[reportCallIssue, reportArgumentType]
-
-        good_step = 2 * jnp.abs(stry) < jnp.minimum(
-            jnp.abs(spre), 3 * jnp.abs(sbis) - delta
-        )
-        use_stry = use_interp & good_step
-
-        spre = jnp.where(use_stry, scur, sbis)
-        scur = jnp.where(use_stry, stry, sbis)
-
-        pre = cur
-        fpre = fcur
-
-        step = jnp.where(
-            jnp.abs(scur) > delta, scur, jnp.where(sbis > 0, delta, -delta)
-        )
-        cur = cur + step
-        fcur = f(cur, *args)
-
-        done = done | converged
-        return pre, cur, blk, fpre, fcur, fblk, spre, scur, done, i + 1
-
-    init = (a, b, zero, fa, fb, zero, zero, zero, done0, 0)
-    pre, cur, blk, fpre, fcur, fblk, spre, scur, done, i = lax.while_loop(
-        cond, body, init
-    )
-    converged = ~jnp.isnan(fcur) & ((fcur == 0.0) | (jnp.abs(blk - cur) < xtol))
-    return jnp.where(converged, cur, jnp.nan)
-
-
-def newton_python(
-    f: Callable[..., Any],
-    df: Callable[..., Any],
-    x0: Any,
-    args: Tuple[Any, ...] = (),
-    ftol: Optional[float] = None,
-    xtol: Optional[float] = None,
-    maxiter: int = 50,
-) -> Any:
-    """Pure-Python (eager) Newton-Raphson method for scalar ``f``.
-
-    Identical convergence criteria to :func:`newton`, but the iteration is an
-    ordinary Python ``for`` loop over scalar values, so it is *not* jittable
-    and not vmappable.  ``f`` and ``df`` must be scalar callables
-    (``f(x, *args) -> scalar``, ``df(x, *args) -> scalar``).
-    """
-    x = x0
-    fx = f(x, *args)
-    if ftol is None:
-        ftol = 100.0 * np.finfo(np.asarray(fx).dtype).eps
-    dx = np.inf
-    for _ in range(maxiter):
-        if np.isnan(fx):
-            return np.nan
-        if abs(fx) <= ftol or (xtol is not None and dx <= xtol):
-            return x
-        d = df(x, *args)
-        if d == 0:
-            return np.nan
-        step = fx / d
-        x = x - step
-        fx = f(x, *args)
-        dx = abs(step)
-    return np.nan
-
-
-def steffensen_python(
-    f: Callable[..., Any],
-    x0: Any,
-    args: Tuple[Any, ...] = (),
-    ftol: Optional[float] = None,
-    xtol: Optional[float] = None,
-    maxiter: int = 50,
-    slope: float = 1.0,
-) -> Any:
-    """Pure-Python (eager) Steffensen's method for scalar ``f``.
-
-    Identical convergence criteria to :func:`steffensen`, but the iteration is
-    an ordinary Python ``for`` loop over scalar values, so it is *not* jittable
-    and not vmappable.  ``f`` must be a scalar callable
-    (``f(x, *args) -> scalar``).  ``slope`` is a characteristic slope of ``f``
-    used to rescale the finite-difference step ``f(x)/slope`` into x-units.
-    """
-    x = x0
-    fx = f(x, *args)
-    if ftol is None:
-        ftol = 100.0 * np.finfo(np.asarray(fx).dtype).eps
-    dx = np.inf
-    for _ in range(maxiter):
-        if np.isnan(fx):
-            return np.nan
-        if abs(fx) <= ftol or (xtol is not None and dx <= xtol):
-            return x
-        denom = f(x + fx / slope, *args) - fx
-        if denom == 0:
-            return np.nan
-        step = fx * fx / (slope * denom)
-        x = x - step
-        fx = f(x, *args)
-        dx = abs(step)
-    return np.nan
-
-
-def steffensen_python_vmapped(
-    f_vmapped: Callable[..., Any],
-    x0: Any,
-    args: Tuple[Any, ...] = (),
-    ftol: Optional[float] = None,
-    xtol: Optional[float] = None,
-    maxiter: int = 50,
-    slope: Union[float, np.ndarray] = 1.0,
-) -> np.ndarray:
-    """Pure-Python (eager) Steffensen's method, vectorised over many starts.
-
-    Concurrently refines each entry of ``x0`` via Steffensen's method, using
-    ``f_vmapped`` (called as ``f_vmapped(x, *args)`` with ``x`` an array) to
-    evaluate ``f`` on the whole active batch at once.  ``slope`` is a
-    characteristic slope of ``f`` (a scalar, or one value per start) used to
-    rescale the finite-difference step ``f(x)/slope`` into x-units.  Returns an
-    array of roots, with ``NaN`` for starts that did not converge.
-    """
-    x = np.atleast_1d(np.asarray(x0)).astype(float).copy()
-    slope = np.broadcast_to(np.asarray(slope, dtype=x.dtype), x.shape)
-    if x.size == 0:
-        return x
-    fx = np.asarray(f_vmapped(x, *args), dtype=x.dtype).copy()
-    if ftol is None:
-        ftol = 100.0 * np.finfo(fx.dtype).eps
-    dx = np.full_like(x, np.inf)
-    active = np.ones(x.shape, dtype=bool)
-    for _ in range(maxiter):
-        active &= ~(np.isnan(fx) | (np.abs(fx) <= ftol))
-        if xtol is not None:
-            active &= ~(dx <= xtol)
-        if not active.any():
-            break
-        h = fx[active] / slope[active]
-        denom = np.asarray(f_vmapped(x[active] + h, *args)) - fx[active]
-        stuck = denom == 0.0
-        safe_denom = np.where(stuck, 1.0, denom)
-        step = fx[active] * fx[active] / (slope[active] * safe_denom)
-        new_x = np.where(stuck, x[active], x[active] - step)
-        new_fx = np.empty(active.sum(), dtype=fx.dtype)
-        nstuck = ~stuck
-        new_fx[nstuck] = np.asarray(f_vmapped(new_x[nstuck], *args))
-        new_fx[stuck] = np.nan
-        x[active] = new_x
-        fx[active] = new_fx
-        dx[active] = np.where(stuck, np.inf, np.abs(step))
-    converged = ~np.isnan(fx) & (np.abs(fx) <= ftol)
-    if xtol is not None:
-        converged = converged | (dx <= xtol)
-    return np.where(converged, x, np.nan)
+    _require_tol(ftol, xtol)
+    a, b = float(a), float(b)
+    _require_bracket(a, b)
+    g = _wrap_f(f)
+    f_a, f_b = await _endpoints(g, a, b, args, fa, fb)
+    return await _brent(g, a, b, args, ftol, xtol, maxiter, f_a, f_b)
