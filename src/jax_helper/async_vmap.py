@@ -116,7 +116,16 @@ _QueueItem = Union[_Request, _Close]
 #: parked on the pool before the worker dispatches anyway. A safety valve so a
 #: task parked on non-pool work (a listener, an I/O loop, an unrelated sleep)
 #: can never starve a batch waiting for the "everyone is parked" condition.
-_SETTLE_TURNS = 10
+#: The wait is bounded twice over: by this many idle turns and, independently,
+#: by ``_SETTLE_TIMEOUT`` seconds of wall-clock time. Whichever fires first
+#: trips the valve, and the debug line names the one that did.
+_SETTLE_TURNS = 100
+
+#: Upper bound in seconds on wall-clock time spent idle-holding a batch before
+#: the settle safety valve dispatches it anyway (see ``_SETTLE_TURNS``). The
+#: ``min_batch_size`` hold and the unparked-task wait together last at most
+#: this long, or ``_SETTLE_TURNS`` idle turns, whichever comes first.
+_SETTLE_TIMEOUT = 0.001
 
 #: The pool never runs more than one batch at a time, so a single worker
 #: thread is all it can ever use.
@@ -222,12 +231,14 @@ class _Pool:
         while it is below ``min_batch_size``, so a preference for full batches
         holds until the safety valve gives up.
 
-        Two turn-based safety valves bound the wait: the batch is full, or the
-        queue has been empty for a few turns while the batch is still below
-        ``min_batch_size`` or something is not parked on the pool. The latter
-        keeps a background task that parks on unrelated work (a listener, an
-        I/O loop) from starving the batch.
+        Two safety valves bound the wait: the batch is full, or the queue has
+        been idle for up to ``_SETTLE_TURNS`` turns / ``_SETTLE_TIMEOUT``
+        seconds while the batch is still below ``min_batch_size`` or something
+        is not parked on the pool. The latter keeps a background task that
+        parks on unrelated work (a listener, an I/O loop) from starving the
+        batch. Both budgets reset whenever a new request arrives.
         """
+        started = self._loop.time()
         idle_turns = 0
         while len(batch) < self._max_batch_size and not self._closing:
             # One turn lets every currently-runnable task reach its submit.
@@ -245,16 +256,27 @@ class _Pool:
                 grew = True
             if grew:
                 idle_turns = 0
+                started = self._loop.time()
                 continue
             if len(batch) >= self._min_batch_size and self._all_parked():
                 return
             idle_turns += 1
-            if idle_turns >= _SETTLE_TURNS:
+            elapsed_ms = (self._loop.time() - started) * 1000.0
+            if (
+                idle_turns >= _SETTLE_TURNS
+                or elapsed_ms >= _SETTLE_TIMEOUT * 1000.0
+            ):
                 # Safety valve: either something stayed unparked (a listener,
-                # an I/O loop, a caller still computing) past the settle
-                # budget, or the batch is simply below ``min_batch_size``. In
-                # debug, say who and what they are parked on -- it is how you
-                # spot the task the batch could have waited for.
+                # an I/O loop, a caller still computing) or the batch is simply
+                # below ``min_batch_size``, and either the idle-turn budget or
+                # the wall-clock budget is spent. The line names the valve
+                # that tripped -- it is how you spot the task the batch could
+                # have waited for.
+                valve = []
+                if idle_turns >= _SETTLE_TURNS:
+                    valve.append("idle-turn budget")
+                if elapsed_ms >= _SETTLE_TIMEOUT * 1000.0:
+                    valve.append(f"time budget ({_SETTLE_TIMEOUT * 1000:.1f} ms)")
                 details = self._describe_unparked()
                 bits = (
                     [f"{len(details)} task(s) were not parked on the pool: "
@@ -271,8 +293,9 @@ class _Pool:
                 _log(
                     self._label,
                     "dispatching after "
-                    f"{_SETTLE_TURNS} idle turns with {len(batch)} "
-                    f"request(s){detail}",
+                    f"{elapsed_ms:.3f} ms / {idle_turns} idle turns with "
+                    f"{len(batch)} request(s){detail}; "
+                    f"safety valve: {' and '.join(valve)}",
                 )
                 return
 

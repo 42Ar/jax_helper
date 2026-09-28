@@ -1132,6 +1132,53 @@ async def test_settle_message_names_each_unparked_task(capsys):
 
 
 @pytest.mark.asyncio
+async def test_settle_message_names_the_idle_turn_budget(capsys):
+    """The settle line names the idle-turn budget when it fires that way."""
+
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="pinned")
+
+    async def background():
+        await asyncio.Event().wait()  # unparked forever, so the valve trips
+
+    bg = asyncio.create_task(background())
+    try:
+        assert await pool.submit("x") == "x"
+    finally:
+        bg.cancel()
+
+    output = capsys.readouterr().err
+    assert "pinned: dispatching after" in output
+    assert "safety valve: idle-turn budget" in output
+
+
+@pytest.mark.asyncio
+async def test_settle_message_names_the_time_budget(capsys):
+    """The settle line names the wall-clock budget when it fires first."""
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="pinned")
+
+    async def background():
+        await asyncio.sleep(0)     # let the worker start collecting
+        time.sleep(0.002)          # block the loop past the 1 ms budget
+        await asyncio.Event().wait()  # then stay unparked, pinning the valve
+
+    bg = asyncio.create_task(background())
+    try:
+        assert await pool.submit("x") == "x"
+    finally:
+        bg.cancel()
+
+    output = capsys.readouterr().err
+    assert "pinned: dispatching after" in output
+    assert "safety valve: time budget (1.0 ms)" in output
+
+
+@pytest.mark.asyncio
 async def test_debug_reports_each_execution_and_its_size(capsys):
     def execute(requests):
         return [request[0] for request in requests]
