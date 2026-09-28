@@ -126,6 +126,57 @@ async def test_parked_waits_for_a_caller_still_computing():
 
 
 @pytest.mark.asyncio
+async def test_an_unrelated_gather_waiter_is_waited_for():
+    """A caller paused on a gather that does not touch the pool is not parked.
+
+    ``_all_parked`` counts a ``gather`` parent as parked only when that
+    gather transitively waits on this pool; an orchestrator of unrelated work
+    is still a caller that can submit, so the open batch must wait for it
+    rather than dispatch early and split the burst.
+    """
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8)
+
+    async def caller():
+        await asyncio.gather(asyncio.sleep(0), asyncio.sleep(0))
+        return await pool.submit("late")
+
+    seed = asyncio.create_task(pool.submit("seed"))
+    late = asyncio.create_task(caller())
+
+    assert await seed == "seed"
+    assert await late == "late"
+
+    assert sizes == [2]
+
+
+@pytest.mark.asyncio
+async def test_a_gather_of_pool_submits_is_counted_parked():
+    """A gather that does reach the pool still coalesces into one batch.
+
+    Tightening the parked rule to pool-dependent gathers must not cost real
+    gather-based bursts their single execution.
+    """
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8)
+
+    results = await asyncio.gather(*[pool.submit(i) for i in range(4)])
+
+    assert results == list(range(4))
+    assert sizes == [4]
+
+
+@pytest.mark.asyncio
 async def test_background_task_does_not_starve_the_batch():
     """A task parked on non-pool work cannot stall a batch forever.
 

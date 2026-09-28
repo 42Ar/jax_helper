@@ -109,15 +109,15 @@ _MAX_WORKERS = 1
 
 
 def _gathering_future_type() -> Optional[type]:
-    """The asyncio type a ``gather``/``wait_for`` parent parks on.
+    """The asyncio type a ``gather`` parent parks on.
 
-    The parents of a batch of concurrent calls usually wait on an internal
-    gathering future rather than on the pool's futures, yet they cannot
-    enqueue anything themselves: their children do the submitting and park on
-    pool futures directly. Recognising the type keeps such an orchestrator
-    from being mistaken for a caller that ought to be waited for. The class
-    lives in ``asyncio.tasks`` on 3.14+ and ``asyncio.futures`` before that;
-    both are internal, like ``Task._fut_waiter`` itself.
+    The parent of a batch of concurrent calls usually waits on an internal
+    gathering future rather than on the pool's futures, yet it cannot enqueue
+    anything itself: its children do the submitting and park on pool futures
+    directly. The type is used by :meth:`_Pool._all_parked`, which insists the
+    gathering actually reach this pool before counting the parent as parked.
+    The class lives in ``asyncio.tasks`` on 3.14+ and ``asyncio.futures``
+    before that; both are internal, like ``Task._fut_waiter`` itself.
     """
     for modname in ("asyncio.tasks", "asyncio.futures"):
         mod = importlib.import_module(modname)
@@ -240,16 +240,37 @@ class _Pool:
                 )
                 return
 
+    def _gather_depends_on_pool(self, gather_future: Any) -> bool:
+        """Whether a ``gather``, transitively, is waiting on this pool.
+
+        A gathering future's children (the per-item tasks ``gather`` created)
+        wait on pool futures directly when the gather includes calls into this
+        pool. Only then may the orchestrating parent count as parked: it can
+        enqueue nothing itself, and its next submit happens after this pool
+        resolves, so dispatching is safe. A gather over unrelated work is a
+        caller still computing, not a parked one.
+        """
+        for child in getattr(gather_future, "_children", ()):
+            waiter = getattr(child, "_fut_waiter", None)
+            if waiter in self._pending:
+                return True
+            if _GATHERING_FUTURE is not None and isinstance(
+                waiter, _GATHERING_FUTURE
+            ):
+                if self._gather_depends_on_pool(waiter):
+                    return True
+        return False
+
     def _all_parked(self) -> bool:
         """True when no live task can enqueue without a batch executing first.
 
         A task is parked on this pool when the future it awaits is one of the
         futures handed out by :meth:`submit`. ``asyncio.Task._fut_waiter`` is
-        a private field but stable across CPython versions; a task awaiting a
-        ``gather`` of pool calls is represented transitively by its children
-        (the per-item tasks ``gather`` creates), which wait on pool futures
-        directly, and the orchestrating parent parks on an internal gathering
-        future that cannot submit -- so it counts as parked too.
+        a private field but stable across CPython versions. A task awaiting a
+        ``gather`` counts as parked only if that gather transitively waits on
+        this pool (:meth:`_gather_depends_on_pool`): the orchestrating parent
+        parks on an internal gathering future and cannot submit, and its
+        children -- which park on pool futures directly -- already count.
         """
         for task in asyncio.all_tasks(self._loop):
             if task is self._task or task.done():
@@ -260,7 +281,8 @@ class _Pool:
             if _GATHERING_FUTURE is not None and isinstance(
                 waiter, _GATHERING_FUTURE
             ):
-                continue
+                if self._gather_depends_on_pool(waiter):
+                    continue
             return False
         return True
 
