@@ -123,9 +123,11 @@ until every coroutine still computing has reached its `submit` and parked
 awaiting a result from the pool, then dispatches — so a burst of `await`s in
 one `asyncio.gather` runs as a single vectorised execution, and even a trickle
 arriving one call per event-loop turn is captured by one batch. A caller still
-doing synchronous work before submitting is waited for rather than missed. The
-batch executes on a dedicated worker thread, so the event loop is never blocked
-by the vectorised run itself. A lone caller runs with no added latency, and no
+doing synchronous work before submitting is waited for rather than missed. By
+default the batch runs inline, so the event loop is busy for the duration of
+the run; pass `run_in_thread=True` to offload it to a dedicated worker thread
+(one per pool) and keep the loop responsive, since JAX and NumPy release the
+GIL during their C work. A lone caller runs with no added latency, and no
 batch ever exceeds `max_batch_size`.
 
 Arguments and leaves inside a short batch are zero-padded up to the next
@@ -187,9 +189,10 @@ silently.
 - **Batching is opportunistic, not a guarantee.** A lone caller runs with no
   added latency, and a batch never waits past the point where every coroutine
   still computing has parked on the pool; callers that arrive later — or that
-  have not yet reached their `submit` — simply go in the next batch. A batch
-  executes on a worker thread and completes whatever has been collected, even
-  if the loop is asked to close while it is running.
+  have not yet reached their `submit` — simply go in the next batch. Whatever
+  has been collected completes even if the loop is asked to close while it is
+  running; with `run_in_thread=True` that batch finishes on its worker thread,
+  not on the loop.
 
 ## Install
 

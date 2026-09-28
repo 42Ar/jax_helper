@@ -21,9 +21,12 @@ concurrent calls -- even ones that reach the ``submit`` at different moments
 never grows past ``max_batch_size``, and a lone caller runs with no added
 latency: with no one else active, the first quiet turn dispatches it.
 
-Batches execute on a dedicated worker thread, so the event loop is never
-frozen while NumPy or JAX compute runs; callers that become ready mid-batch
-submit straight into the next batch's queue.
+By default each batch runs inline in the worker task, so the event loop is
+busy for the duration of the vectorised run. Pass ``run_in_thread=True`` to
+offload execution to a dedicated worker thread instead: NumPy and JAX release
+the GIL during their C compute, so the loop keeps servicing callers -- the
+ones becoming ready mid-batch submit straight into the next batch's queue --
+at the cost of one worker thread per pool.
 
 The pooling machinery is plain asyncio and knows nothing about JAX: it takes
 injected ``key`` and ``execute`` callables, which is what makes it testable on
@@ -144,6 +147,7 @@ class _Pool:
         debug: bool = False,
         label: str = "",
         coalescing: str = "parked",
+        threaded: bool = False,
     ) -> None:
         self._execute = execute
         self._key = key
@@ -152,6 +156,7 @@ class _Pool:
         self._debug = debug
         self._label = label
         self._coalescing = coalescing
+        self._threaded = threaded
         self._queue: "asyncio.Queue[_QueueItem]" = asyncio.Queue()
         self._task: Optional["asyncio.Task[None]"] = None
         self._threadpool: Optional[ThreadPoolExecutor] = None
@@ -298,17 +303,24 @@ class _Pool:
 
     async def _dispatch(self, group: List[_Request]) -> None:
         self._report(group)
+        requests = [request for request, _ in group]
         try:
-            # Run the batch on a dedicated thread so the event loop is not
-            # frozen by NumPy/JAX compute; the GIL-releasing C work there lets
-            # the loop keep servicing callers in parallel.
-            if self._threadpool is None:
-                self._threadpool = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
-            results = await self._loop.run_in_executor(
-                self._threadpool,
-                self._execute,
-                [request for request, _ in group],
-            )
+            if self._threaded:
+                # Run the batch on a dedicated worker thread so the event loop
+                # is not frozen by NumPy/JAX compute; the GIL-releasing C work
+                # there lets the loop keep servicing callers in parallel.
+                if self._threadpool is None:
+                    self._threadpool = ThreadPoolExecutor(
+                        max_workers=_MAX_WORKERS
+                    )
+                results = await self._loop.run_in_executor(
+                    self._threadpool, self._execute, requests
+                )
+            else:
+                # Inline in the worker task: the loop is busy for the run, but
+                # no thread is created and no values move across a thread
+                # boundary.
+                results = self._execute(requests)
             if len(results) != len(group):
                 raise ValueError(
                     f"executor returned {len(results)} results "
@@ -488,6 +500,7 @@ def async_vmap_pool(
     max_batch_size: int,
     debug: bool = False,
     coalescing: str = "parked",
+    run_in_thread: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
 
@@ -518,9 +531,16 @@ def async_vmap_pool(
             parked awaiting a result from this pool and nothing new is queued,
             so a burst of concurrent calls -- even ones reaching the decorator
             at slightly different moments -- runs as one ``vmap`` execution
-            rather than one per arrival. Batches execute on a dedicated worker
-            thread, so the loop is never blocked by the compute. A lone caller
-            runs with no added latency.
+            rather than one per arrival. A lone caller runs with no added
+            latency.
+        run_in_thread: If True, execute each batch on a dedicated worker
+            thread (one thread per pool), so the event loop is never blocked
+            by the vectorised run; NumPy and JAX release the GIL during their
+            C compute, letting the loop keep servicing callers. If False (the
+            default), the batch runs inline in the worker task and the loop
+            is busy for the duration of the run, but no thread is created and
+            nothing crosses a thread boundary. The batch glue only passes
+            values in and out, so threading is safe either way.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -530,7 +550,8 @@ def async_vmap_pool(
     several loops (or from several tests) without them interfering.
 
     Raises:
-        TypeError: If ``max_batch_size`` is not an ``int``.
+        TypeError: If ``max_batch_size`` is not an ``int``, or ``run_in_thread``
+            is not a ``bool``.
         ValueError: If ``max_batch_size`` is less than 1, or ``coalescing``
             is not ``"parked"``.
     """
@@ -545,6 +566,10 @@ def async_vmap_pool(
     if coalescing != "parked":
         raise ValueError(
             f"coalescing must be 'parked', got {coalescing!r}"
+        )
+    if not isinstance(run_in_thread, bool):
+        raise TypeError(
+            f"run_in_thread must be a bool, got {type(run_in_thread).__name__}"
         )
 
     def decorator(scalar_fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -578,6 +603,7 @@ def async_vmap_pool(
                     debug=debug,
                     label=getattr(scalar_fn, "__name__", ""),
                     coalescing=coalescing,
+                    threaded=run_in_thread,
                 )
                 pools[loop] = pool
             return await pool.submit(*items)

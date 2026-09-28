@@ -169,8 +169,8 @@ async def test_batch_never_exceeds_max_batch_size():
 
 
 @pytest.mark.asyncio
-async def test_execution_runs_on_a_worker_thread():
-    """Batches execute off the event-loop thread, on a dedicated worker."""
+async def test_execution_runs_on_the_loop_thread_by_default():
+    """Without threading, batches execute inline in the worker task."""
     thread_ids = []
 
     def execute(requests):
@@ -178,6 +178,22 @@ async def test_execution_runs_on_a_worker_thread():
         return [request[0] for request in requests]
 
     pool = _pool(execute)
+    await pool.submit(1)
+    await pool.submit(2)
+
+    assert thread_ids == [threading.get_ident()] * 2
+
+
+@pytest.mark.asyncio
+async def test_execution_runs_on_a_worker_thread():
+    """With ``threaded=True`` batches execute off the loop thread."""
+    thread_ids = []
+
+    def execute(requests):
+        thread_ids.append(threading.get_ident())
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, threaded=True)
     await pool.submit(1)
     await pool.submit(2)
 
@@ -193,7 +209,7 @@ async def test_loop_stays_responsive_during_execution():
         time.sleep(0.05)  # simulate a long JAX run
         return [request[0] for request in requests]
 
-    pool = _pool(execute)
+    pool = _pool(execute, threaded=True)
     start = time.perf_counter()
     task = asyncio.create_task(pool.submit(1))
     # A batch executing on the worker thread must not freeze the loop.
@@ -205,13 +221,31 @@ async def test_loop_stays_responsive_during_execution():
 
 
 @pytest.mark.asyncio
+async def test_loop_is_busy_during_inline_execution():
+    """By default a long batch holds the loop until it returns."""
+    def execute(requests):
+        time.sleep(0.05)
+        return [request[0] for request in requests]
+
+    pool = _pool(execute)
+    start = time.perf_counter()
+    task = asyncio.create_task(pool.submit(1))
+    # An independent timer cannot run while the batch holds the loop.
+    await asyncio.sleep(0.02)
+    elapsed = time.perf_counter() - start
+
+    assert await task == 1
+    assert elapsed >= 0.045, elapsed
+
+
+@pytest.mark.asyncio
 async def test_aclose_waits_for_the_in_flight_batch():
     """Closing during an executing batch still delivers that batch's result."""
     def execute(requests):
         time.sleep(0.02)
         return [request[0] for request in requests]
 
-    pool = _pool(execute)
+    pool = _pool(execute, threaded=True)
     task = asyncio.create_task(pool.submit(7))
     await asyncio.sleep(0)  # let the batch open (and start executing)
     await pool.aclose()     # must wait for the in-flight run, not drop it
@@ -428,6 +462,16 @@ def test_coalescing_must_be_parked():
         async_vmap_pool(8, coalescing="opportunistic")
     async_vmap_pool(8, coalescing="parked")
     async_vmap_pool(8)
+    async_vmap_pool(8, run_in_thread=True)
+
+
+def test_run_in_thread_must_be_a_bool():
+    with pytest.raises(TypeError, match="run_in_thread must be a bool"):
+        async_vmap_pool(8, run_in_thread="yes")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="run_in_thread must be a bool"):
+        async_vmap_pool(8, run_in_thread=1)  # type: ignore[arg-type]
+    async_vmap_pool(8, run_in_thread=False)
+    async_vmap_pool(8, run_in_thread=True)
 
 
 @pytest.mark.asyncio
