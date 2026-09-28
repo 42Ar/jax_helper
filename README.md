@@ -1,6 +1,7 @@
 # jax_helper
 
-Async, NumPy-only scalar root-finding routines.
+Async scalar root-finding routines, plus a pooled JAX executor for running
+them (or anything else) across concurrent calls in one vectorised batch.
 
 ## Features
 
@@ -11,6 +12,7 @@ Async, NumPy-only scalar root-finding routines.
 - `steffensen(f, x0, ...)` — derivative-free Steffensen method.
 - `roots_scan(f, a, b, ...)` — all roots bracketed on a uniform grid.
 - `roots_chebyshev(f, a, b, ...)` — all roots via recursive Chebyshev subdivision.
+- `async_vmap_pool(max_batch_size, ...)` — async pooled executor over `vmap`.
 
 Every routine is a coroutine. `f` (and `df`) must be awaitable and return a
 finite scalar; anything else raises `TypeError` or `ValueError`. Scalar solvers
@@ -87,6 +89,56 @@ coefficient a linear function can never make negligible, the fit is never
 judged sufficient, and the search subdivides the full `2 ** depth`. Low `n` is
 correct but slow, since extra subdivision is what buys the missing resolution.
 `depth` bounds that recursion, so lower it for a cheap bound.
+
+## Batched execution with `async_vmap_pool`
+
+`async_vmap_pool` turns a scalar function into an async function whose
+concurrent calls are coalesced into a single `vmap` execution:
+
+```python
+from jax_helper import async_vmap_pool
+
+@async_vmap_pool(max_batch_size=8)
+def f(x, args):
+    return args["scale"] * x ** 2 + args["bias"]
+
+await asyncio.gather(*[f(0.5, {"scale": 2.0, "bias": 1.0}) for _ in range(8)])
+```
+
+The decorated function may take **any number of arguments, each an arbitrary
+pytree** — dicts, lists, tuples, nested containers, NumPy arrays, or bare
+scalars, mixed freely. Every value in every pytree is free to change between
+calls.
+
+**Batching groups on structure and leaf shape, never on values.** That is what
+lets freely-varying arguments still batch: two requests are grouped together
+exactly when stacking them is possible. Requests that cannot share a `vmap`
+(different arity, different pytree structure, or a different leaf shape) are
+split into their own executions, so one odd shape costs an extra dispatch
+rather than failing everything queued alongside it.
+
+Arguments and leaves inside a short batch are zero-padded to `max_batch_size`
+(`pad_to_max=True`, the default) so JAX does not recompile for each distinct
+batch size, then trimmed back to the real size. Because every argument is
+padded, the whole batch keeps a static leading dimension.
+
+Each event loop gets its own pool, so the decorated function is usable from
+several loops concurrently without them interfering.
+
+### Limits
+
+- **At least one argument per call.** An empty request has no array to map
+  over and raises `ValueError`.
+- **Leaves must be numeric or array-like.** Strings and arbitrary objects
+  cannot be stacked and raise `TypeError`.
+- **Leaf shapes must agree within a batch.** Requests of different leaf shapes
+  run in separate executions, each of which compiles once and is then reused.
+  `pad_to_max` stabilises the batch dimension only, not leaf dimensions.
+- **Everything is traced.** Values arrive as JAX tracers, so you cannot branch
+  on them in Python. Use `jax.lax.cond` or similar, or capture the constant
+  lexically in a closure factory if you need real Python control flow.
+- **Batching is opportunistic.** A lone caller runs immediately; the pool
+  yields once for other ready coroutines but never waits to fill a batch.
 
 ## Install
 

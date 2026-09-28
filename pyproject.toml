@@ -5,11 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jax-helper"
 version = "0.1.0"
-description = "Async scalar root-finding routines for pure Python"
+description = "Async root-finding routines with pooled vectorised execution"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 dependencies = [
+    "jax",
     "numpy",
 ]
 
