@@ -819,6 +819,29 @@ async def test_debug_off_prints_nothing(capsys):
 
 
 @pytest.mark.asyncio
+async def test_debug_reports_when_the_settle_valve_fires(capsys):
+    """The settle-turns safety valve says so, so a stuck caller is found."""
+
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="pinned")
+
+    async def background():
+        await asyncio.Event().wait()  # parked on a non-pool future, forever
+
+    bg = asyncio.create_task(background())
+    try:
+        assert await pool.submit("x") == "x"
+    finally:
+        bg.cancel()
+
+    output = capsys.readouterr().err
+    assert "pinned: dispatching after" in output
+    assert "a task was never parked on the pool" in output
+
+
+@pytest.mark.asyncio
 async def test_debug_reports_each_execution_and_its_size(capsys):
     def execute(requests):
         return [request[0] for request in requests]

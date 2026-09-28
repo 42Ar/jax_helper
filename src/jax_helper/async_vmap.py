@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import functools
+import importlib
 import sys
 import weakref
 from collections import defaultdict
@@ -101,6 +102,29 @@ _SETTLE_TURNS = 5
 #: The pool never runs more than one batch at a time, so a single worker
 #: thread is all it can ever use.
 _MAX_WORKERS = 1
+
+
+def _gathering_future_type() -> Optional[type]:
+    """The asyncio type a ``gather``/``wait_for`` parent parks on.
+
+    The parents of a batch of concurrent calls usually wait on an internal
+    gathering future rather than on the pool's futures, yet they cannot
+    enqueue anything themselves: their children do the submitting and park on
+    pool futures directly. Recognising the type keeps such an orchestrator
+    from being mistaken for a caller that ought to be waited for. The class
+    lives in ``asyncio.tasks`` on 3.14+ and ``asyncio.futures`` before that;
+    both are internal, like ``Task._fut_waiter`` itself.
+    """
+    for modname in ("asyncio.tasks", "asyncio.futures"):
+        mod = importlib.import_module(modname)
+        cls = getattr(mod, "_GatheringFuture", None)
+        if cls is not None:
+            return cls
+    return None
+
+
+#: Cached orchestrator type for :meth:`_Pool._all_parked`.
+_GATHERING_FUTURE = _gathering_future_type()
 
 
 class _Pool:
@@ -198,6 +222,16 @@ class _Pool:
                 return
             idle_turns += 1
             if idle_turns >= _SETTLE_TURNS:
+                # Safety valve: something stayed unparked (a listener, an I/O
+                # loop, a caller still computing) past the settle budget. In
+                # debug, say so -- it is how you spot the task the batch
+                # could have waited for.
+                _log(
+                    self._label,
+                    "dispatching after "
+                    f"{_SETTLE_TURNS} idle turns with {len(batch)} "
+                    "request(s); a task was never parked on the pool",
+                )
                 return
 
     def _all_parked(self) -> bool:
@@ -208,14 +242,20 @@ class _Pool:
         a private field but stable across CPython versions; a task awaiting a
         ``gather`` of pool calls is represented transitively by its children
         (the per-item tasks ``gather`` creates), which wait on pool futures
-        directly.
+        directly, and the orchestrating parent parks on an internal gathering
+        future that cannot submit -- so it counts as parked too.
         """
         for task in asyncio.all_tasks(self._loop):
             if task is self._task or task.done():
                 continue
             waiter = getattr(task, "_fut_waiter", None)
-            if waiter not in self._pending:
-                return False
+            if waiter in self._pending:
+                continue
+            if _GATHERING_FUTURE is not None and isinstance(
+                waiter, _GATHERING_FUTURE
+            ):
+                continue
+            return False
         return True
 
     async def _dispatch_grouped(self, batch: List[_Request]) -> None:
