@@ -12,8 +12,10 @@ them (or anything else) across concurrent calls in one vectorised batch.
 - `steffensen(f, x0, ...)` — derivative-free Steffensen method.
 - `roots_scan(f, a, b, ...)` — all roots bracketed on a uniform grid.
 - `roots_chebyshev(f, a, b, ...)` — all roots via recursive Chebyshev subdivision.
-- `async_vmap_pool(max_batch_size, ..., debug=False)` — async pooled executor
-  over `vmap`; `debug=True` reports each execution and its batch size.
+- `async_vmap_pool(max_batch_size, ..., debug=False, padding='up', min_batch_size=1)` —
+  async pooled executor over `vmap`; `debug=True` reports each execution and
+  its batch size, `padding='down'` runs exact power-of-two prefixes instead of
+  padding, and `min_batch_size` (default 1) holds below-min batches.
 
 Every routine is a coroutine. `f` (and `df`) must be awaitable and return a
 finite scalar; anything else raises `TypeError` or `ValueError`. Scalar solvers
@@ -128,17 +130,25 @@ default the batch runs on a dedicated worker thread (one per pool), so the
 event loop is never blocked — JAX and NumPy release the GIL during their C
 work; pass `run_in_thread=False` to run the batch inline in the worker task
 instead. A lone caller runs with no added latency, and no batch ever exceeds
-`max_batch_size`.
+`max_batch_size`. With `min_batch_size` (default 1) a batch below the minimum
+is held for more arrivals until the settle valve gives up.
 
-Arguments and leaves inside a short batch are zero-padded up to the next
-power of two (never more than `max_batch_size`), then trimmed back to the real
-size. Because every argument is padded, the whole batch keeps a leading
-dimension from a small bounded set — the powers of two from `2` up to
-`max_batch_size` — and JAX's `jit` cache reuses each compiled entry, so a batch
-of 100 and one of 128 share the same compiled code. Padding therefore never
-exceeds a factor of two, and a workload whose batch sizes keep changing
-compiles the vectorised function at most `log2(max_batch_size) + 1` times.
-Stacking, padding and trimming all run on NumPy, off the compiler.
+With `padding="up"` (the default), arguments and leaves inside a short batch
+are zero-padded up to the next power of two (never more than
+`max_batch_size`), then trimmed back to the real size. Because every argument
+is padded, the whole batch keeps a leading dimension from a small bounded set
+— the powers of two from `2` up to `max_batch_size` — and JAX's `jit` cache
+reuses each compiled entry, so a batch of 100 and one of 128 share the same
+compiled code. Padding therefore never exceeds a factor of two, and a workload
+whose batch sizes keep changing compiles the vectorised function at most
+`log2(max_batch_size) + 1` times. Stacking, padding and trimming all run on
+NumPy, off the compiler.
+
+With `padding="down"`, a batch is instead split: the largest power-of-two
+prefix runs now and the remaining requests shift into the next batch, so no
+request is ever padded — at the cost of extra executions (seven requests run
+as `4 + 2 + 1`). A split only happens when the power-of-two prefix is at least
+`min_batch_size`; below that the whole (padded) batch runs.
 
 Each event loop gets its own pool, so the decorated function is usable from
 several loops concurrently without them interfering.

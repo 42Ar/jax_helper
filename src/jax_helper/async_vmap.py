@@ -14,12 +14,21 @@ stacking them is possible, so free-varying arguments cost nothing.
 Batching is *coalescing*: the worker keeps the current batch open and
 dispatches it once every live task is parked awaiting a result from this pool
 and nothing new is queued -- the whole program is standing on the pool, so no
-more requests can arrive until one of the batches executes. A caller that is
-still computing (or still on an earlier await) is waited for, so a burst of
+more requests can arrive until one of the batches executes -- and, if set, the
+batch holds at least ``min_batch_size`` requests. A caller that is still
+computing (or still on an earlier await) is waited for, so a burst of
 concurrent calls -- even ones that reach the ``submit`` at different moments
 -- runs as one execution. ``coalescing="parked"`` is the only mode. A batch
 never grows past ``max_batch_size``, and a lone caller runs with no added
 latency: with no one else active, the first quiet turn dispatches it.
+
+With ``padding="up"`` (the default) a batch is zero-padded along axis 0 of
+every leaf to the next power of two, so one execution serves the whole batch
+at the cost of at most a factor of two of compute. With ``padding="down"`` a
+batch instead runs at the largest power-of-two prefix and the remainder is
+shifted to the next batch, so no request is ever padded, at the cost of extra
+executions. Stacking, padding and trimming happen on NumPy arrays off the
+compiler either way.
 
 By default each batch runs on a dedicated worker thread, so the event loop is
 never frozen while NumPy or JAX compute runs; the GIL-releasing C work there
@@ -149,6 +158,8 @@ class _Pool:
         label: str = "",
         coalescing: str = "parked",
         threaded: bool = True,
+        padding: str = "up",
+        min_batch_size: int = 1,
     ) -> None:
         self._execute = execute
         self._key = key
@@ -158,6 +169,8 @@ class _Pool:
         self._label = label
         self._coalescing = coalescing
         self._threaded = threaded
+        self._padding = padding
+        self._min_batch_size = min_batch_size
         self._queue: "asyncio.Queue[_QueueItem]" = asyncio.Queue()
         self._task: Optional["asyncio.Task[None]"] = None
         self._threadpool: Optional[ThreadPoolExecutor] = None
@@ -199,12 +212,15 @@ class _Pool:
         futures and nothing new is queued: at that point no request can reach
         the pool until a batch executes, so the batch is complete. A caller
         still computing is *not* parked, so it is waited for rather than
-        missed -- no turn-counting, no fixed linger.
+        missed -- no turn-counting, no fixed linger. A batch is not dispatched
+        while it is below ``min_batch_size``, so a preference for full batches
+        holds until the safety valve gives up.
 
         Two turn-based safety valves bound the wait: the batch is full, or the
-        queue has been empty for a few turns while something still is
-        not parked on the pool. The latter keeps a background task that parks
-        on unrelated work (a listener, an I/O loop) from starving the batch.
+        queue has been empty for a few turns while the batch is still below
+        ``min_batch_size`` or something is not parked on the pool. The latter
+        keeps a background task that parks on unrelated work (a listener, an
+        I/O loop) from starving the batch.
         """
         idle_turns = 0
         while len(batch) < self._max_batch_size and not self._closing:
@@ -224,19 +240,28 @@ class _Pool:
             if grew:
                 idle_turns = 0
                 continue
-            if self._all_parked():
+            if len(batch) >= self._min_batch_size and self._all_parked():
                 return
             idle_turns += 1
             if idle_turns >= _SETTLE_TURNS:
-                # Safety valve: something stayed unparked (a listener, an I/O
-                # loop, a caller still computing) past the settle budget. In
+                # Safety valve: either something stayed unparked (a listener,
+                # an I/O loop, a caller still computing) past the settle
+                # budget, or the batch is simply below ``min_batch_size``. In
                 # debug, say who and what they are parked on -- it is how you
                 # spot the task the batch could have waited for.
-                unparked = self._describe_unparked()
-                detail = (
-                    f"; {len(unparked)} task(s) were not parked on the pool: "
-                    + "; ".join(unparked)
-                ) if unparked else ""
+                details = self._describe_unparked()
+                bits = (
+                    [f"{len(details)} task(s) were not parked on the pool: "
+                     + "; ".join(details)]
+                    if details
+                    else []
+                )
+                if self._min_batch_size > 1 and len(batch) < self._min_batch_size:
+                    bits.append(
+                        f"{len(batch)} request(s) below min_batch_size "
+                        f"{self._min_batch_size}"
+                    )
+                detail = ("; " + "; ".join(bits)) if bits else ""
                 _log(
                     self._label,
                     "dispatching after "
@@ -345,6 +370,24 @@ class _Pool:
             return
 
         for group in groups.values():
+            n = len(group)
+            if (
+                self._padding == "down"
+                and n > 1
+                and (n & (n - 1)) != 0
+            ):
+                # ``padding="down"``: run the largest power-of-two prefix of
+                # the group and shift the remainder to the next batch, so no
+                # request is ever zero-padded. Only split when the prefix is
+                # at least ``min_batch_size``; otherwise the whole group runs
+                # and is padded as usual.
+                floor = 1 << (n.bit_length() - 1)
+                if floor >= self._min_batch_size:
+                    head, tail = group[:floor], group[floor:]
+                    for item in tail:
+                        self._queue.put_nowait(item)
+                    await self._dispatch(head)
+                    continue
             await self._dispatch(group)
 
     def _report(self, group: List[_Request]) -> None:
@@ -564,6 +607,8 @@ def async_vmap_pool(
     debug: bool = False,
     coalescing: str = "parked",
     run_in_thread: bool = True,
+    padding: str = "up",
+    min_batch_size: int = 1,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
 
@@ -572,14 +617,16 @@ def async_vmap_pool(
     calls are batched into one ``vmap`` execution.
 
     Values in any pytree may differ freely between calls; batching groups on
-    structure and leaf shape only. Every batch is zero-padded along axis 0 of
-    every leaf up to the next power of two (never more than
-    ``max_batch_size``), so padding adds at most a factor of two of work and
-    the vectorised function compiles once per distinct rounded size -- never
-    per batch size. Stacking, padding and trimming all happen on NumPy arrays,
-    so variable batch sizes never reach the compiler. Each request resolves to
-    a NumPy array; results are pulled off the device host-side every batch,
-    which is negligible on CPU.
+    structure and leaf shape only. With ``padding="up"`` (the default) every
+    batch is zero-padded along axis 0 of every leaf up to the next power of
+    two (never more than ``max_batch_size``), so padding adds at most a factor
+    of two of work and the vectorised function compiles once per distinct
+    rounded size -- never per batch size. With ``padding="down"`` a batch is
+    instead run at the largest power-of-two prefix and the rest is shifted to
+    the next batch, so no request is ever padded. Stacking, padding and
+    trimming all happen on NumPy arrays, so variable batch sizes never reach
+    the compiler. Each request resolves to a NumPy array; results are pulled
+    off the device host-side every batch, which is negligible on CPU.
 
     Args:
         max_batch_size: The maximum number of requests drained into one
@@ -604,6 +651,20 @@ def async_vmap_pool(
             the duration of the run, but no thread is created and nothing
             crosses a thread boundary. The batch glue only passes values in and
             out, so threading is safe either way.
+        padding: How a batch whose size is not a power of two is handled.
+            ``"up"`` (the default) zero-pads the batch up to the next power of
+            two, so one execution serves the whole batch at the cost of at most
+            a factor of two of compute. ``"down"`` runs the largest power-of-two
+            prefix of the batch and shifts the remaining requests to the next
+            batch, so nothing is ever padded, at the cost of extra executions.
+            A batch is only split when the prefix is at least
+            ``min_batch_size``.
+        min_batch_size: The minimum number of requests a batch may hold before
+            the worker dispatches it, when the parked condition is met.
+            Defaults to 1, which waits only for every caller to be parked; a
+            larger value makes the pool hold small batches until more requests
+            arrive or the settle valve gives up, and caps the ``"down"``
+            padding split.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -613,10 +674,11 @@ def async_vmap_pool(
     several loops (or from several tests) without them interfering.
 
     Raises:
-        TypeError: If ``max_batch_size`` is not an ``int``, or ``run_in_thread``
-            is not a ``bool``.
-        ValueError: If ``max_batch_size`` is less than 1, or ``coalescing``
-            is not ``"parked"``.
+        TypeError: If ``max_batch_size`` or ``min_batch_size`` is not an
+            ``int``, or ``run_in_thread`` is not a ``bool``.
+        ValueError: If ``max_batch_size`` is less than 1, ``min_batch_size``
+            is less than 1 or greater than ``max_batch_size``, ``coalescing``
+            is not ``"parked"``, or ``padding`` is not ``"up"`` or ``"down"``.
     """
     if not isinstance(max_batch_size, int):
         raise TypeError(
@@ -633,6 +695,23 @@ def async_vmap_pool(
     if not isinstance(run_in_thread, bool):
         raise TypeError(
             f"run_in_thread must be a bool, got {type(run_in_thread).__name__}"
+        )
+    if padding not in ("up", "down"):
+        raise ValueError(
+            f"padding must be 'up' or 'down', got {padding!r}"
+        )
+    if not isinstance(min_batch_size, int):
+        raise TypeError(
+            f"min_batch_size must be an int, got {type(min_batch_size).__name__}"
+        )
+    if min_batch_size < 1:
+        raise ValueError(
+            f"min_batch_size must be at least 1, got {min_batch_size}"
+        )
+    if min_batch_size > max_batch_size:
+        raise ValueError(
+            f"min_batch_size ({min_batch_size}) cannot exceed "
+            f"max_batch_size ({max_batch_size})"
         )
 
     def decorator(scalar_fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -667,6 +746,8 @@ def async_vmap_pool(
                     label=getattr(scalar_fn, "__name__", ""),
                     coalescing=coalescing,
                     threaded=run_in_thread,
+                    padding=padding,
+                    min_batch_size=min_batch_size,
                 )
                 pools[loop] = pool
             return await pool.submit(*items)

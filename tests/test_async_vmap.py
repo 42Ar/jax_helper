@@ -219,6 +219,125 @@ async def test_batch_never_exceeds_max_batch_size():
     assert sum(sizes) == 20
 
 
+def _is_power_of_two(n):
+    return n > 0 and (n & (n - 1)) == 0
+
+
+@pytest.mark.asyncio
+async def test_padding_down_runs_power_of_two_prefixes():
+    """``padding="down"`` runs the floor power of two and defers the rest."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, padding="down")
+    results = await asyncio.gather(*[pool.submit(i) for i in range(5)])
+
+    assert results == list(range(5))
+    assert sizes == [4, 1]
+    assert all(_is_power_of_two(n) for n in sizes)
+
+
+@pytest.mark.asyncio
+async def test_padding_down_splits_a_seven_into_four_two_one():
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, padding="down")
+    results = await asyncio.gather(*[pool.submit(i) for i in range(7)])
+
+    assert results == list(range(7))
+    assert sizes == [4, 2, 1]
+    assert all(_is_power_of_two(n) for n in sizes)
+
+
+@pytest.mark.asyncio
+async def test_padding_up_keeps_the_whole_batch():
+    """The default ``padding="up"`` still serves the whole batch at once."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8)
+    results = await asyncio.gather(*[pool.submit(i) for i in range(5)])
+
+    assert results == list(range(5))
+    assert sizes == [5]
+
+
+@pytest.mark.asyncio
+async def test_padding_down_split_respects_min_batch_size():
+    """A split needs its prefix to reach ``min_batch_size``."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, padding="down", min_batch_size=2)
+    results = await asyncio.gather(*[pool.submit(i) for i in range(6)])
+
+    assert results == list(range(6))
+    assert sizes == [4, 2]
+
+
+@pytest.mark.asyncio
+async def test_sub_min_batch_is_dispatched_whole_and_padded():
+    """A batch below ``min_batch_size`` never splits; it runs padded."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, padding="down", min_batch_size=4)
+    results = await asyncio.gather(*[pool.submit(i) for i in range(3)])
+
+    # floor(3) = 2 < min(4), so no split: one whole (padded) batch, reached
+    # via the settle valve after the below-min wait.
+    assert results == list(range(3))
+    assert sizes == [3]
+
+
+@pytest.mark.asyncio
+async def test_min_batch_size_holds_small_batches_then_dispatches():
+    """Below-min batches wait for the parked condition and the valve."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, min_batch_size=3)
+    results = await asyncio.gather(pool.submit(1), pool.submit(2))
+
+    assert results == [1, 2]
+    assert sizes == [2]
+
+
+@pytest.mark.asyncio
+async def test_min_batch_size_still_coalesces_a_full_burst():
+    """A burst still coalesces with ``min_batch_size`` above 1."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, min_batch_size=4)
+    results = await asyncio.gather(*[pool.submit(i) for i in range(4)])
+
+    assert results == list(range(4))
+    assert sizes == [4]
+
+
 @pytest.mark.asyncio
 async def test_execution_runs_on_the_loop_thread_when_not_threaded():
     """With ``threaded=False`` batches execute inline in the worker task."""
@@ -523,6 +642,28 @@ def test_run_in_thread_must_be_a_bool():
         async_vmap_pool(8, run_in_thread=1)  # type: ignore[arg-type]
     async_vmap_pool(8, run_in_thread=False)
     async_vmap_pool(8, run_in_thread=True)
+
+
+def test_padding_must_be_up_or_down():
+    with pytest.raises(ValueError, match="padding must be 'up' or 'down'"):
+        async_vmap_pool(8, padding="sideways")
+    with pytest.raises(ValueError, match="padding must be 'up' or 'down'"):
+        async_vmap_pool(8, padding="round")
+    async_vmap_pool(8, padding="up")
+    async_vmap_pool(8, padding="down")
+
+
+def test_min_batch_size_validation():
+    with pytest.raises(TypeError, match="min_batch_size must be an int"):
+        async_vmap_pool(8, min_batch_size="2")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="min_batch_size must be an int"):
+        async_vmap_pool(8, min_batch_size=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="at least 1"):
+        async_vmap_pool(8, min_batch_size=0)
+    with pytest.raises(ValueError, match="cannot exceed max_batch_size"):
+        async_vmap_pool(8, min_batch_size=9)
+    async_vmap_pool(8, min_batch_size=1)
+    async_vmap_pool(8, min_batch_size=8)
 
 
 @pytest.mark.asyncio
