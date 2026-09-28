@@ -278,17 +278,35 @@ def _build_executor(
 
     def execute(requests: List[Tuple[Any, ...]]) -> Sequence[Any]:
         n = len(requests)
-        # Leafwise, so pytree arguments, bare scalars, and mixtures of the two
-        # all stack correctly. NumPy keeps request count out of the compiler:
-        # the vectorised function below is the only thing that is ever jitted,
-        # and it only ever sees the static `max_batch_size` (or the real `n`)
-        # leading dimension.
+        # The stack, pad and trim are the batch *glue*, and it deliberately
+        # runs on NumPy rather than jnp. The vectorised function below is the
+        # only thing that should ever reach the compiler; sizing it with every
+        # call's real batch size would make it recompile per distinct `n`.
+        #
+        # Originally the glue used jnp.stack / jnp.pad / result[:n]. With
+        # pad_to_max the fused function's signature is stable (its leading
+        # dimension is always max_batch_size), but the glue runs on the real
+        # `n`, so its ops kept changing shape: _pad compiled once per distinct
+        # n, jnp.stack compiled per split of the drain, and slicing a device
+        # array with a runtime bound n created a fresh jit(dynamic_slice) on
+        # every dispatch - even with an identical signature - flooding the
+        # compile logs whenever batch sizes varied. ~50 XLA compilations per
+        # burst of distinct sizes, each around half a second, versus the one
+        # compile of the fused function that actually matters.
+        #
+        # NumPy escapes all of that: np.stack / np.pad see plain host arrays,
+        # and np.asarray(...)[:n] trims after the XLA result was pulled to the
+        # host, so variable sizes never enter JAX dispatch.
         stacked = jax.tree_util.tree_map(lambda *xs: np.stack(xs), *requests)
+        # Leafwise, so pytree arguments, bare scalars, and mixtures of the two
+        # all stack correctly: each leaf is stacked against its counterparts.
         if pad_to_max and n < max_batch_size:
             padded = jax.tree_util.tree_map(
                 lambda arr: _padded(arr, max_batch_size), stacked
             )
-            # Trim host-side; results are plain NumPy arrays.
+            # np.asarray blocks on the XLA result and transfers it to the
+            # host; the [:n] then slices a plain NumPy array. Results are the
+            # real batch size, as plain NumPy arrays.
             return cast(Sequence[Any], np.asarray(vmapped(padded))[:n])
         return cast(Sequence[Any], np.asarray(vmapped(stacked)))
 
