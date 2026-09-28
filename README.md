@@ -121,7 +121,10 @@ rather than failing everything queued alongside it.
 Arguments and leaves inside a short batch are zero-padded to `max_batch_size`
 (`pad_to_max=True`, the default) so JAX does not recompile for each distinct
 batch size, then trimmed back to the real size. Because every argument is
-padded, the whole batch keeps a static leading dimension.
+padded, the whole batch keeps a static leading dimension. Stacking, padding
+and trimming all run on NumPy, off the compiler, so a workload whose batch
+sizes keep changing compiles the vectorised function exactly once per
+structure and dtype.
 
 Each event loop gets its own pool, so the decorated function is usable from
 several loops concurrently without them interfering.

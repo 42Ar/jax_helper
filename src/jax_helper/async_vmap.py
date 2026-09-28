@@ -29,7 +29,19 @@ import functools
 import sys
 import weakref
 from collections import defaultdict
-from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
+
+import numpy as np
 
 #: One queued request: a tuple of per-item arguments, and the future awaiting
 #: that request's result.
@@ -246,9 +258,11 @@ def _build_executor(
 
     With ``pad_to_max``, short batches are zero-padded along axis 0 of every
     leaf, so the vectorised function always sees a static leading dimension and
-    is not recompiled for each distinct batch size. The trim back to the real
-    batch size happens outside the compiled function, where varying sizes are
-    free.
+    is not recompiled for each distinct batch size. The glue -- stacking,
+    padding, and trimming back to the real batch size -- runs on NumPy arrays,
+    where varying sizes are free and never touch the compiler; whoever pads
+    streams in a mix of batch sizes, only the vectorised function itself is
+    ever compiled, and once.
     """
     import jax
     import jax.numpy as jnp
@@ -259,24 +273,27 @@ def _build_executor(
 
     vmapped = jax.jit(jax.vmap(unpack, in_axes=0))
 
-    def pad(tree: Any, size: int) -> Any:
-        def pad_leaf(leaf: Any) -> Any:
-            arr = jnp.asarray(leaf)
-            width = [(0, size - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
-            return jnp.pad(arr, width)
-
-        return jax.tree_util.tree_map(pad_leaf, tree)
+    def _padded(arr: Any, size: int) -> Any:
+        width = [(0, size - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
+        return np.pad(arr, width)
 
     def execute(requests: List[Tuple[Any, ...]]) -> Sequence[Any]:
         n = len(requests)
         # Leafwise, so pytree arguments, bare scalars, and mixtures of the two
-        # all stack correctly.
-        stacked = jax.tree_util.tree_map(
-            lambda *xs: jnp.stack(xs), *requests
-        )
+        # all stack correctly. NumPy keeps request count out of the compiler:
+        # the vectorised function below is the only thing that is ever jitted,
+        # and it only ever sees the static `max_batch_size` (or the real `n`)
+        # leading dimension.
+        stacked = jax.tree_util.tree_map(lambda *xs: np.stack(xs), *requests)
         if pad_to_max and n < max_batch_size:
-            return vmapped(pad(stacked, max_batch_size))[:n]
-        return vmapped(stacked)
+            padded = jax.tree_util.tree_map(
+                lambda arr: _padded(arr, max_batch_size), stacked
+            )
+            batch = vmapped(padded)
+            # Trim host-side, then re-wrap so results keep their jax.Array
+            # contract even though the trim never went through JAX.
+            return cast(Sequence[Any], jnp.asarray(np.asarray(batch)[:n]))
+        return cast(Sequence[Any], jnp.asarray(np.asarray(vmapped(stacked))))
 
     return execute
 
@@ -295,7 +312,10 @@ def async_vmap_pool(
     Values in any pytree may differ freely between calls; batching groups on
     structure and leaf shape only. Where padding applies it is applied to
     every argument and every leaf, and the result is trimmed back to the real
-    batch size, so short batches still run against a static shape.
+    batch size, so short batches still run against a static shape. Stacking,
+    padding and trimming all happen on NumPy arrays, so varying batch sizes
+    never cause JAX recompilations -- only the vectorised function itself is
+    compiled, and once per distinct structure and dtype.
 
     Args:
         max_batch_size: The maximum number of requests drained into one
@@ -303,6 +323,8 @@ def async_vmap_pool(
             is set. Each compatible group within a batch is at most this size.
         pad_to_max: If True, pad short batches up to ``max_batch_size`` with
             zeros so JAX does not recompile for every distinct batch size.
+            Where True results are moved off the device (and back) each batch
+            to do that trimming host-side, which is negligible on CPU.
         debug: If True, print a line to stderr for every execution, naming the
             function and the number of requests in that batch. Useful for
             confirming that concurrent calls really are coalescing.

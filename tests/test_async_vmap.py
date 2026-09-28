@@ -467,6 +467,46 @@ async def test_each_leaf_shape_reuses_its_compiled_entry():
 
 
 @pytest.mark.asyncio
+async def test_pad_to_max_never_recompiles_across_batch_sizes():
+    """Varying batch sizes must not recompile the batch glue.
+
+    The stack/pad/trim helpers run on NumPy, so a second -- differently sized
+    -- batch must not spawn any new XLA compilations beyond the single compile
+    of the vectorised function itself.
+    """
+    import logging
+
+    import jax
+
+    compiles = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            compiles.append(record.getMessage())
+
+    old, old_level = getattr(jax.config, "jax_log_compiles"), logging.getLogger().level
+    jax.config.update("jax_log_compiles", True)
+    logging.getLogger().setLevel(logging.WARNING)
+    handler = _Capture()
+    logging.getLogger().addHandler(handler)
+    try:
+        @async_vmap_pool(8, pad_to_max=True)
+        def f(x):
+            return x * 2
+
+        await asyncio.gather(f(1.0), f(2.0))
+        await asyncio.gather(*[f(float(i)) for i in range(5)])
+    finally:
+        logging.getLogger().removeHandler(handler)
+        logging.getLogger().setLevel(old_level)
+        jax.config.update("jax_log_compiles", old)
+
+    jits = [m for m in compiles if "Compiling jit(" in m]
+    assert len(jits) == 1
+    assert "jit(f)" in jits[0]
+
+
+@pytest.mark.asyncio
 async def test_non_numeric_leaf_fails_every_caller():
     @async_vmap_pool(4)
     def f(x, args):
