@@ -127,8 +127,9 @@ _SETTLE_TURNS = 100
 
 #: Upper bound in seconds on wall-clock time spent idle-holding a batch before
 #: the settle safety valve dispatches it anyway (see ``_SETTLE_TURNS``). The
-#: ``min_batch_size`` hold and the unparked-task wait together last at most
-#: this long, or ``_SETTLE_TURNS`` idle turns, whichever comes first.
+#: unparked-task wait lasts at most this long, or ``_SETTLE_TURNS`` idle turns,
+#: whichever comes first. Both budgets reset whenever a new request arrives,
+#: so the wait is bounded by *idle* time, not by the batch's total age.
 _SETTLE_TIMEOUT = 0.1
 
 #: The pool never runs more than one batch at a time, so a single worker
@@ -420,11 +421,10 @@ class _Pool:
                     waiter.get_coro(), "__qualname__", "another task"
                 )
                 descriptions.append(f"{name} awaiting {awaited}")
-            elif _GATHERING_FUTURE is not None and isinstance(
-                waiter, _GATHERING_FUTURE
-            ):
-                descriptions.append(f"{name} mid-gather")
             else:
+                # A ``gather`` waiter is never listed here: :meth:`_is_parked`
+                # counts it as parked, so it does not appear in
+                # :meth:`_unparked_tasks`. Anything else is a non-pool future.
                 descriptions.append(
                     f"{name} parked on {type(waiter).__name__}"
                 )
@@ -763,14 +763,16 @@ def async_vmap_pool(
             sub-minimum batch behind.
         min_batch_size: The minimum number of requests a batch may hold before
             the worker dispatches it, when the parked condition is met.
-            Defaults to 1, which waits only for every caller to be parked; a
-            larger value makes the pool hold small batches until more requests
-            arrive or the settle valve gives up, and gates the ``"down"``
-            padding split. It also floors the compiled leading dimension: a
-            dispatched batch of fewer than ``min_batch_size`` requests is
-            padded up to the next power of two of the minimum, so a wave
-            leftover or a lone call neither recompiles a small shape nor shares
-            nothing -- it reuses the rounded entry like any other batch.
+            Defaults to 1, which waits only for every caller to be parked. The
+            minimum never *holds* a batch waiting for arrivals: once every
+            live task is parked a sub-minimum batch dispatches immediately, so
+            ``min_batch_size`` is purely a shape contract. It floors the
+            compiled leading dimension: a dispatched batch of fewer than
+            ``min_batch_size`` requests is padded up to the next power of two
+            of the minimum, so a wave leftover or a lone call neither
+            recompiles a small shape nor shares nothing -- it reuses the
+            rounded entry like any other batch. It also gates the ``"down"``
+            padding split, so a split never leaves a sub-minimum batch behind.
 
     Returns:
         A decorator producing an async function that awaits to its result.

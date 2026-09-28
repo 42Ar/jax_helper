@@ -1295,6 +1295,101 @@ async def test_settle_message_condenses_a_large_unparked_set(capsys):
 
 
 @pytest.mark.asyncio
+async def test_valve_line_prints_up_to_the_limit_verbatim(capsys):
+    """Exactly ``_UNPARKED_LIST_LIMIT`` tasks are listed individually."""
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="pinned")
+
+    event = asyncio.Event()
+    pinned = [asyncio.create_task(event.wait()) for _ in range(20)]
+    try:
+        assert await pool.submit("x") == "x"
+    finally:
+        for t in pinned:
+            t.cancel()
+
+    output = capsys.readouterr().err
+    assert "20 task(s) were not parked on the pool" in output
+    assert output.count("Event.wait parked on Future") == 20
+    assert "20 x Event.wait parked on Future" not in output
+
+
+@pytest.mark.asyncio
+async def test_valve_line_condenses_beyond_the_limit(capsys):
+    """One past the limit, the list collapses to a per-kind tally."""
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="pinned")
+
+    event = asyncio.Event()
+    pinned = [asyncio.create_task(event.wait()) for _ in range(21)]
+    try:
+        assert await pool.submit("x") == "x"
+    finally:
+        for t in pinned:
+            t.cancel()
+
+    output = capsys.readouterr().err
+    assert "21 task(s) were not parked on the pool" in output
+    assert "21 x Event.wait parked on Future" in output
+    assert output.count("Event.wait parked on Future") == 1
+
+
+@pytest.mark.asyncio
+async def test_settle_budget_measures_idle_time_not_total_hold(capsys):
+    """Arrivals reset the settle budgets, so only *idle* time trips the valve.
+
+    A trickle of submissions spaced ~5 ms apart for well past the 100 ms
+    budget coalesces into one open batch and never fires the valve: each
+    arrival resets both the idle-turn and wall-clock budgets. When the trickle
+    stops and nothing else is parked, the batch dispatches through the parked
+    condition instead -- no ``dispatching after`` line, no valve.
+    """
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=1024, debug=True, label="burst")
+    k = 40
+    stopped = False
+    tasks = []
+
+    async def clog():
+        # Makes each loop turn last ~5 ms, so the turn budget never races the
+        # trickle (one worker check per turn) while the wall-clock hold grows
+        # past the 100 ms settle timeout.
+        nonlocal stopped
+        while not stopped:
+            t0 = time.perf_counter()
+            while time.perf_counter() - t0 < 0.005:
+                pass
+            await asyncio.sleep(0)
+
+    async def producer():
+        nonlocal stopped
+        for i in range(k):
+            tasks.append(asyncio.create_task(pool.submit(i)))
+            await asyncio.sleep(0)
+        stopped = True  # the last submitter has run; let clog go before the tail
+
+    clog_task = asyncio.create_task(clog())
+    started = time.perf_counter()
+    await asyncio.gather(producer(), clog_task)
+    results = await asyncio.gather(*tasks)
+    elapsed = time.perf_counter() - started
+
+    assert results == list(range(k))
+    assert sizes == [k]
+    assert elapsed > 0.1  # one open batch held far beyond the time budget
+    assert "dispatching after" not in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
 async def test_settle_message_names_the_idle_turn_budget(capsys):
     """The settle line names the idle-turn budget when it fires that way."""
 
