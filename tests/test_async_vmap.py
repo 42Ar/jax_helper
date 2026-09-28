@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import subprocess
 import sys
 
@@ -14,9 +15,11 @@ def _arity_key(request):
     return len(request)
 
 
-def _pool(execute, key=_arity_key, max_batch_size=8):
+def _pool(execute, key=_arity_key, max_batch_size=8, **kwargs):
     """A pool bound to the running loop, for testing the async core directly."""
-    return _Pool(execute, key, max_batch_size, asyncio.get_running_loop())
+    return _Pool(
+        execute, key, max_batch_size, asyncio.get_running_loop(), **kwargs
+    )
 
 
 # --- pooling behaviour -------------------------------------------------------
@@ -517,3 +520,149 @@ def test_async_vmap_pool_is_exported_lazily():
 def test_unknown_attribute_raises_attribute_error():
     with pytest.raises(AttributeError, match="no attribute 'nope'"):
         jax_helper.nope
+
+
+# --- debug mode ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_debug_off_prints_nothing(capsys):
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute)
+    await pool.submit(1)
+
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_each_execution_and_its_size(capsys):
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=4, debug=True, label="solver")
+    # 10 requests at max_batch_size 4 -> 4, 4, 2
+    await asyncio.gather(*[pool.submit(i) for i in range(10)])
+
+    pattern = re.compile(r"executing (\d+) request")
+    sizes = [int(m.group(1)) for m in
+             (pattern.search(line) for line in capsys.readouterr().err.splitlines())
+             if m is not None]
+    assert sizes == [4, 4, 2]
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_the_function_name(capsys):
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="roots_scan")
+    await pool.submit(1)
+
+    assert "roots_scan" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_debug_goes_to_stderr_not_stdout(capsys):
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="f")
+    await pool.submit(1)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "f" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_a_batch_that_raises(capsys):
+    def execute(requests):
+        raise RuntimeError("boom")
+
+    pool = _pool(execute, debug=True, label="boom")
+    await asyncio.gather(
+        *[pool.submit(i) for i in range(3)], return_exceptions=True
+    )
+
+    assert "boom: executing 3 request(s)" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_each_group_of_a_split_batch(capsys):
+    """Incompatible shapes run as separate executions, so each is reported.
+
+    This also pins that the size is the *group's*, not the drained batch's:
+    four requests drained, but each group holds only two.
+    """
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, key=lambda r: r[1], max_batch_size=8, debug=True,
+                 label="split")
+    await asyncio.gather(
+        pool.submit(1, "a"), pool.submit(2, "a"),
+        pool.submit(3, "b"), pool.submit(4, "b"),
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 2
+    assert all("executing 2 request(s)" in line for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_group_size_not_drained_batch_size(capsys):
+    """Unequal groups expose the difference: 3 + 1 drained, so not 4 + 4."""
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, key=lambda r: r[1], max_batch_size=8, debug=True,
+                 label="skew")
+    await asyncio.gather(
+        pool.submit(1, "a"), pool.submit(2, "a"), pool.submit(3, "a"),
+        pool.submit(4, "b"),
+    )
+
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 2
+    assert "executing 3 request(s)" in lines[0]
+    assert "executing 1 request(s)" in lines[1]
+
+
+@pytest.mark.asyncio
+async def test_debug_reports_the_real_count_not_the_padded_one(capsys):
+    """pad_to_max changes the compiled shape, not the number of callers."""
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    # The real executor pads, but the pool only ever sees real requests.
+    pool = _pool(execute, max_batch_size=8, debug=True, label="padded")
+    await pool.submit(1)
+
+    assert "executing 1 request(s)" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_decorator_debug_flag_reports_every_dispatch(capsys):
+    @async_vmap_pool(max_batch_size=4, debug=True)
+    def f(x):
+        return x * 2
+
+    results = await asyncio.gather(*[f(i) for i in range(6)])
+
+    assert [float(v) for v in results] == [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+    err = capsys.readouterr().err
+    assert "f: executing 4 request(s)" in err
+    assert "f: executing 2 request(s)" in err
+
+
+@pytest.mark.asyncio
+async def test_decorator_debug_defaults_to_off(capsys):
+    @async_vmap_pool(max_batch_size=4)
+    def f(x):
+        return x * 2
+
+    await f(1)
+
+    assert capsys.readouterr().err == ""

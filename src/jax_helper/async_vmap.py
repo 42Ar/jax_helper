@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import sys
 import weakref
 from collections import defaultdict
 from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
@@ -57,11 +58,15 @@ class _Pool:
         key: Key,
         max_batch_size: int,
         loop: asyncio.AbstractEventLoop,
+        debug: bool = False,
+        label: str = "",
     ) -> None:
         self._execute = execute
         self._key = key
         self._max_batch_size = max_batch_size
         self._loop = loop
+        self._debug = debug
+        self._label = label
         self._queue: "asyncio.Queue[_Request]" = asyncio.Queue()
         self._task: Optional["asyncio.Task[None]"] = None
         self._pending: "set[asyncio.Future[Any]]" = set()
@@ -117,7 +122,22 @@ class _Pool:
         for group in groups.values():
             self._dispatch(group)
 
+    def _report(self, group: List[_Request]) -> None:
+        """Log one execution: which function, and how many requests it carried.
+
+        Emitted before the executor runs, so a batch that raises is still
+        reported. Goes to stderr to keep it out of a program's own output.
+        """
+        if not self._debug:
+            return
+        print(
+            f"[async_vmap_pool] {self._label or 'function'}: executing "
+            f"{len(group)} request(s)",
+            file=sys.stderr,
+        )
+
     def _dispatch(self, group: List[_Request]) -> None:
+        self._report(group)
         try:
             results = self._execute([request for request, _ in group])
             if len(results) != len(group):
@@ -253,6 +273,7 @@ def _build_executor(
 def async_vmap_pool(
     max_batch_size: int,
     pad_to_max: bool = True,
+    debug: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Turn a JAX scalar function into an asynchronous pooled executor.
 
@@ -271,6 +292,9 @@ def async_vmap_pool(
             is set. Each compatible group within a batch is at most this size.
         pad_to_max: If True, pad short batches up to ``max_batch_size`` with
             zeros so JAX does not recompile for every distinct batch size.
+        debug: If True, print a line to stderr for every execution, naming the
+            function and the number of requests in that batch. Useful for
+            confirming that concurrent calls really are coalescing.
 
     Returns:
         A decorator producing an async function that awaits to its result.
@@ -310,7 +334,14 @@ def async_vmap_pool(
             loop = asyncio.get_running_loop()
             pool = pools.get(loop)
             if pool is None:
-                pool = _Pool(execute, _request_key, max_batch_size, loop)
+                pool = _Pool(
+                    execute,
+                    _request_key,
+                    max_batch_size,
+                    loop,
+                    debug=debug,
+                    label=getattr(scalar_fn, "__name__", ""),
+                )
                 pools[loop] = pool
             return await pool.submit(*items)
 

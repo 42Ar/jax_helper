@@ -12,7 +12,8 @@ them (or anything else) across concurrent calls in one vectorised batch.
 - `steffensen(f, x0, ...)` — derivative-free Steffensen method.
 - `roots_scan(f, a, b, ...)` — all roots bracketed on a uniform grid.
 - `roots_chebyshev(f, a, b, ...)` — all roots via recursive Chebyshev subdivision.
-- `async_vmap_pool(max_batch_size, ...)` — async pooled executor over `vmap`.
+- `async_vmap_pool(max_batch_size, ..., debug=False)` — async pooled executor
+  over `vmap`; `debug=True` reports each execution and its batch size.
 
 Every routine is a coroutine. `f` (and `df`) must be awaitable and return a
 finite scalar; anything else raises `TypeError` or `ValueError`. Scalar solvers
@@ -124,6 +125,28 @@ padded, the whole batch keeps a static leading dimension.
 
 Each event loop gets its own pool, so the decorated function is usable from
 several loops concurrently without them interfering.
+
+### Debugging the batching
+
+`debug=True` prints one line per execution to **stderr**, naming the function
+and how many requests that execution carried:
+
+```python
+@async_vmap_pool(max_batch_size=4, debug=True)
+def quad(x, args):
+    return args["scale"] * x ** 2 + args["bias"]
+
+# ten concurrent calls, at most four per batch:
+# [async_vmap_pool] quad: executing 4 request(s)
+# [async_vmap_pool] quad: executing 4 request(s)
+# [async_vmap_pool] quad: executing 2 request(s)
+```
+
+The count is the number of **real requests**, not the padded size, and it is
+the size of each compatible group rather than of the whole drained batch — so
+a batch that splits because of differing shapes reports each group separately.
+Lines are printed before the executor runs, so a batch that raises is still
+reported.
 
 ### Limits
 
