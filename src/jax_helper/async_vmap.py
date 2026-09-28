@@ -231,12 +231,15 @@ class _Pool:
         while it is below ``min_batch_size``, so a preference for full batches
         holds until the safety valve gives up.
 
-        Two safety valves bound the wait: the batch is full, or the queue has
-        been idle for up to ``_SETTLE_TURNS`` turns / ``_SETTLE_TIMEOUT``
-        seconds while the batch is still below ``min_batch_size`` or something
-        is not parked on the pool. The latter keeps a background task that
-        parks on unrelated work (a listener, an I/O loop) from starving the
-        batch. Both budgets reset whenever a new request arrives.
+        Two safety valves bound the wait: the batch has reached
+        ``max_batch_size`` -- which dispatches it immediately, with any
+        overflow left queued to become the following (split) batch -- or the
+        queue has been idle for up to ``_SETTLE_TURNS`` turns /
+        ``_SETTLE_TIMEOUT`` seconds while the batch is still below
+        ``min_batch_size`` or something is not parked on the pool. The latter
+        keeps a background task that parks on unrelated work (a listener, an
+        I/O loop) from starving the batch. Both budgets reset whenever a new
+        request arrives.
         """
         started = self._loop.time()
         idle_turns = 0
@@ -244,6 +247,9 @@ class _Pool:
             # One turn lets every currently-runnable task reach its submit.
             await asyncio.sleep(0)
             grew = False
+            # Drain every queued request up to the cap. Anything past the cap
+            # stays in the queue: that remainder is the split, and the next
+            # loop of ``_run`` collects it as its own batch.
             while len(batch) < self._max_batch_size and not self._queue.empty():
                 item = self._queue.get_nowait()
                 if isinstance(item, _Close):
@@ -254,6 +260,13 @@ class _Pool:
                     break
                 batch.append(item)
                 grew = True
+            if len(batch) >= self._max_batch_size:
+                # The number of tasks is now equal to (or past, if the cap is
+                # ever relaxed) ``max_batch_size``: dispatch immediately.
+                # A full batch is never held -- not for the parked condition,
+                # not by an unparked task -- and the overflow drains into the
+                # next batch rather than waiting.
+                return
             if grew:
                 idle_turns = 0
                 started = self._loop.time()

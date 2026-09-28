@@ -294,6 +294,49 @@ async def test_batch_never_exceeds_max_batch_size():
     assert sum(sizes) == 20
 
 
+@pytest.mark.asyncio
+async def test_a_full_batch_dispatches_immediately(capsys):
+    """Reaching ``max_batch_size`` dispatches at once, unparked task or not."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=8, debug=True, label="full")
+
+    async def background():
+        await asyncio.Event().wait()  # parked on a non-pool future, forever
+
+    bg = asyncio.create_task(background())
+    try:
+        results = await asyncio.gather(*[pool.submit(i) for i in range(8)])
+    finally:
+        bg.cancel()
+
+    assert results == list(range(8))
+    assert sizes == [8]
+    assert "dispatching after" not in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_a_wave_exceeding_max_splits_into_capped_batches(capsys):
+    """An overshooting wave runs a full batch now; the overflow is the split."""
+    sizes = []
+
+    def execute(requests):
+        sizes.append(len(requests))
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, max_batch_size=4, debug=True, label="split")
+    results = await asyncio.gather(*[pool.submit(i) for i in range(10)])
+
+    assert results == list(range(10))
+    assert sizes == [4, 4, 2]
+    assert all(s <= 4 for s in sizes)
+    assert "dispatching after" not in capsys.readouterr().err
+
+
 def _is_power_of_two(n):
     return n > 0 and (n & (n - 1)) == 0
 

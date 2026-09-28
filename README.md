@@ -130,7 +130,10 @@ default the batch runs on a dedicated worker thread (one per pool), so the
 event loop is never blocked — JAX and NumPy release the GIL during their C
 work; pass `run_in_thread=False` to run the batch inline in the worker task
 instead. A lone caller runs with no added latency, and no batch ever exceeds
-`max_batch_size`. With `min_batch_size` (default 1) a batch below the minimum
+`max_batch_size`: the moment a batch fills to that cap it is dispatched
+immediately — not held for the parked condition — and a wave that overshoots
+the cap splits, running a full batch now and leaving the overflow queued for
+the next batch. With `min_batch_size` (default 1) a batch below the minimum
 is held for more arrivals until the settle valve gives up, and one that is
 still dispatched below it is padded up to the minimum rather than compiling a
 small shape.
