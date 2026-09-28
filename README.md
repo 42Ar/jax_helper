@@ -128,8 +128,9 @@ several loops concurrently without them interfering.
 
 ### Debugging the batching
 
-`debug=True` prints one line per execution to **stderr**, naming the function,
-how many requests that execution carried, and a wall-clock timestamp:
+`debug=True` prints two lines per execution to **stderr**, one just before the
+executor runs and one when it returns, each naming the function, how many
+requests that execution carried, and a wall-clock timestamp:
 
 ```python
 @async_vmap_pool(max_batch_size=4, debug=True)
@@ -138,15 +139,19 @@ def quad(x, args):
 
 # ten concurrent calls, at most four per batch:
 # [2026-09-28 05:41:06.123] [async_vmap_pool] quad: executing 4 request(s)
-# [2026-09-28 05:41:06.124] [async_vmap_pool] quad: executing 4 request(s)
-# [2026-09-28 05:41:06.125] [async_vmap_pool] quad: executing 2 request(s)
+# [2026-09-28 05:41:06.127] [async_vmap_pool] quad: executed 4 request(s)
+# [2026-09-28 05:41:06.128] [async_vmap_pool] quad: executing 4 request(s)
+# [2026-09-28 05:41:06.131] [async_vmap_pool] quad: executed 4 request(s)
+# [2026-09-28 05:41:06.132] [async_vmap_pool] quad: executing 2 request(s)
+# [2026-09-28 05:41:06.134] [async_vmap_pool] quad: executed 2 request(s)
 ```
 
 The count is the number of **real requests**, not the padded size, and it is
 the size of each compatible group rather than of the whole drained batch — so
 a batch that splits because of differing shapes reports each group separately.
-Lines are printed before the executor runs, so a batch that raises is still
-reported.
+The `executing` line is printed before the executor runs, so a batch that
+raises is still reported, and the `executed` line is printed whatever the
+outcome.
 
 ### Limits
 

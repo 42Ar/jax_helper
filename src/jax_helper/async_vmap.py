@@ -124,17 +124,24 @@ class _Pool:
             self._dispatch(group)
 
     def _report(self, group: List[_Request]) -> None:
-        """Log one execution: which function, and how many requests it carried.
+        """Log the start of one execution, ahead of running the executor.
 
         Emitted before the executor runs, so a batch that raises is still
         reported. Goes to stderr to keep it out of a program's own output.
         """
+        self._log(group, "executing")
+
+    def _report_done(self, group: List[_Request]) -> None:
+        """Log completion of one execution, after the executor has run."""
+        self._log(group, "executed")
+
+    def _log(self, group: List[_Request], verb: str) -> None:
         if not self._debug:
             return
         stamp = datetime.datetime.now().isoformat(sep=" ", timespec="milliseconds")
         print(
             f"[{stamp}] [async_vmap_pool] {self._label or 'function'}: "
-            f"executing {len(group)} request(s)",
+            f"{verb} {len(group)} request(s)",
             file=sys.stderr,
         )
 
@@ -151,12 +158,14 @@ class _Pool:
             # Every caller in the group gets the failure. Not re-raised: the
             # group has reported itself, and the worker stays alive to serve
             # the next batch.
+            self._report_done(group)
             self._settle(group, exc)
             return
 
         for (_, future), value in zip(group, results):
             if not future.done():
                 future.set_result(value)
+        self._report_done(group)
 
     @staticmethod
     def _settle(group: List[_Request], exc: BaseException) -> None:

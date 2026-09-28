@@ -579,6 +579,23 @@ async def test_debug_reports_a_datetime_timestamp(capsys):
 
 
 @pytest.mark.asyncio
+async def test_debug_reports_completion_with_timestamp(capsys):
+    def execute(requests):
+        return [request[0] for request in requests]
+
+    pool = _pool(execute, debug=True, label="f")
+    await pool.submit(1)
+
+    lines = capsys.readouterr().err.splitlines()
+    start, done = lines[0], lines[1]
+    assert "executing 1 request(s)" in start.split("]", 1)[1]
+    assert "executed 1 request(s)" in done.split("]", 1)[1]
+    before = datetime.fromisoformat(start.split("]", 1)[0][1:])
+    after = datetime.fromisoformat(done.split("]", 1)[0][1:])
+    assert after >= before
+
+
+@pytest.mark.asyncio
 async def test_debug_goes_to_stderr_not_stdout(capsys):
     def execute(requests):
         return [request[0] for request in requests]
@@ -622,8 +639,10 @@ async def test_debug_reports_each_group_of_a_split_batch(capsys):
     )
 
     lines = capsys.readouterr().err.splitlines()
-    assert len(lines) == 2
-    assert all("executing 2 request(s)" in line for line in lines)
+    start = [l for l in lines if "executing 2 request(s)" in l]
+    done = [l for l in lines if "executed 2 request(s)" in l]
+    assert len(start) == 2
+    assert len(done) == 2
 
 
 @pytest.mark.asyncio
@@ -640,9 +659,11 @@ async def test_debug_reports_group_size_not_drained_batch_size(capsys):
     )
 
     lines = capsys.readouterr().err.splitlines()
-    assert len(lines) == 2
+    assert len(lines) == 4
     assert "executing 3 request(s)" in lines[0]
-    assert "executing 1 request(s)" in lines[1]
+    assert "executed 3 request(s)" in lines[1]
+    assert "executing 1 request(s)" in lines[2]
+    assert "executed 1 request(s)" in lines[3]
 
 
 @pytest.mark.asyncio
