@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jax-helper"
+name = "jax_helper"
 version = "0.1.0"
 description = "Async root-finding, CMA-ES and Nelder-Mead routines with pooled vectorised execution"
 readme = "README.md"

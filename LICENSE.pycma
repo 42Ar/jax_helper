@@ -17,7 +17,7 @@ order, so that for equal normal samples it produces bitwise identical state.
 
 pycma is distributed under the BSD 3-Clause License, reproduced verbatim below.
 Note that the `cma` package is an independent reference implementation: it is
-not a dependency of `jax-helper` and is never imported by the library.  It is a
+not a dependency of `jax_helper` and is never imported by the library.  It is a
 development dependency only, used to verify that this port matches bitwise.
 
 
