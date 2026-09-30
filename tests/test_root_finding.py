@@ -2,7 +2,15 @@ import asyncio
 import numpy as np
 import pytest
 
-from jax_helper import bisection, brent, newton, roots_scan, secant, steffensen
+from jax_helper import (
+    NonFiniteEvaluationError,
+    bisection,
+    brent,
+    newton,
+    roots_scan,
+    secant,
+    steffensen,
+)
 
 CBRT_2 = 2.0 ** (1.0 / 3.0)
 OMEGA = 0.7390851332151607
@@ -360,9 +368,9 @@ async def test_bracketed_rejects_non_finite_precomputed_endpoints(solver):
         return x - 1.0
 
     for kwargs, exc, msg in [
-        ({"fa": float("nan")}, ValueError, "fa must be finite"),
-        ({"fb": float("inf")}, ValueError, "fb must be finite"),
-        ({"fb": float("-inf")}, ValueError, "fb must be finite"),
+        ({"fa": float("nan")}, NonFiniteEvaluationError, "fa must be finite"),
+        ({"fb": float("inf")}, NonFiniteEvaluationError, "fb must be finite"),
+        ({"fb": float("-inf")}, NonFiniteEvaluationError, "fb must be finite"),
         ({"fa": [1.0]}, TypeError, "fa must be a scalar"),
     ]:
         with pytest.raises(exc, match=msg):
@@ -468,13 +476,13 @@ async def test_f_must_return_a_finite_value(bad):
     async def f_bad(x):
         return bad
     for solver, args in [(bisection, (0.0, 2.0)), (brent, (0.0, 2.0))]:
-        with pytest.raises(ValueError):
+        with pytest.raises(NonFiniteEvaluationError):
             await solver(f_bad, *args, ftol=1e-10)
-    with pytest.raises(ValueError):
+    with pytest.raises(NonFiniteEvaluationError):
         await newton(f_bad, df_cubic, 1.0, ftol=1e-10)
-    with pytest.raises(ValueError):
+    with pytest.raises(NonFiniteEvaluationError):
         await secant(f_bad, 0.0, 2.0, ftol=1e-10)
-    with pytest.raises(ValueError):
+    with pytest.raises(NonFiniteEvaluationError):
         await steffensen(f_bad, 1.0, ftol=1e-10)
 
 
@@ -483,8 +491,15 @@ async def test_f_must_return_a_finite_value(bad):
 async def test_df_must_return_a_finite_value(bad):
     async def df_bad(x):
         return bad
-    with pytest.raises(ValueError):
+    with pytest.raises(NonFiniteEvaluationError):
         await newton(f_cubic, df_bad, 1.0, ftol=1e-10)
+
+
+def test_non_finite_error_is_still_a_value_error():
+    # the ValueError base is a published guarantee, not an accident: a caller
+    # already wrapping a solve in `except ValueError` must keep catching this,
+    # so a refactor to a standalone base is a breaking change and fails here
+    assert issubclass(NonFiniteEvaluationError, ValueError)
 
 
 @pytest.mark.asyncio

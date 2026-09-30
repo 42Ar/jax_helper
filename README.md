@@ -19,10 +19,11 @@ them (or anything else) across concurrent calls in one vectorised batch.
   a below-min batch pads up to it, never held.
 
 Every routine is a coroutine. `f` (and `df`) must be awaitable and return a
-finite scalar; anything else raises `TypeError` or `ValueError`. Scalar solvers
-return a Python `float` (`NaN` if they did not converge); the multi-root finders
-return a sorted `list` of finite roots. Independent evaluations run
-concurrently via `asyncio.gather`, so batching means gathering coroutines.
+finite scalar; a non-scalar return raises `TypeError`, and a non-finite one
+raises `NonFiniteEvaluationError`. Scalar solvers return a Python `float`
+(`NaN` if they did not converge); the multi-root finders return a sorted
+`list` of finite roots. Independent evaluations run concurrently via
+`asyncio.gather`, so batching means gathering coroutines.
 
 ## Tolerances
 
@@ -58,7 +59,13 @@ A diverging iterate is a failure to converge, not a bad function: `newton`,
 runaway step is reported rather than handed to `f`, which would usually just
 overflow. A non-finite value from `f` itself still raises, since that is the
 caller's function misbehaving at a point the solver legitimately asked about.
-Precomputed bracketed `fa`/`fb` are held to the same rule as evaluated values.
+Precomputed bracketed `fa`/`fb` are held to the same rule as evaluated values,
+so both report a non-finite value as `NonFiniteEvaluationError`.
+
+`NonFiniteEvaluationError` subclasses `ValueError`, so existing
+`except ValueError` around a solve keeps working; catch it by name to tell a
+non-finite callback result apart from other value errors, such as a reversed
+bracket.
 
 The bracketed solvers `bisection`, `brent`, `roots_scan`, and `roots_chebyshev`
 require `a < b`. An empty or reversed interval is a caller mistake rather than a

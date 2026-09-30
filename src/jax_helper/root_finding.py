@@ -12,11 +12,26 @@ import numpy as np
 AsyncF = Callable[..., Awaitable[Any]]
 
 
+class NonFiniteEvaluationError(ValueError):
+    """Raised when a callback, or a supplied endpoint value, is not finite.
+
+    A ``NaN`` or an infinity is never a usable function value: it silently
+    poisons every sign comparison, tolerance test, and interpolation built on
+    top of it, so it is rejected where it enters rather than propagated.
+
+    Subclassing :class:`ValueError` is deliberate.  A non-finite result is
+    still a bad *value*, so an existing ``except ValueError`` around a solve
+    keeps catching it, while a caller that cares about the distinction can
+    catch this type specifically.
+    """
+
+
 def _wrap_f(f: AsyncF) -> Callable[..., Awaitable[float]]:
     """Wrap an awaitable ``f`` so it returns a validated finite scalar.
 
-    Raises TypeError if the result is not a scalar, and ValueError if it is
-    not finite (``NaN`` or infinite).
+    Raises TypeError if the result is not a scalar, and
+    :class:`NonFiniteEvaluationError` if it is not finite (``NaN`` or
+    infinite).
     """
     async def wrapper(x: Any, *args: Any) -> float:
         y = await f(x, *args)
@@ -24,7 +39,9 @@ def _wrap_f(f: AsyncF) -> Callable[..., Awaitable[float]]:
             raise TypeError(f"f must return a scalar, got {type(y).__name__}")
         y = float(y)
         if not math.isfinite(y):
-            raise ValueError(f"f returned a non-finite value ({y!r}) at x = {x!r}")
+            raise NonFiniteEvaluationError(
+                f"f returned a non-finite value ({y!r}) at x = {x!r}"
+            )
         return y
     return wrapper
 
@@ -58,7 +75,7 @@ def _check_endpoint(value: Any, label: str) -> float:
         raise TypeError(f"{label} must be a scalar, got {type(value).__name__}")
     y = float(value)
     if not math.isfinite(y):
-        raise ValueError(f"{label} must be finite, got {y!r}")
+        raise NonFiniteEvaluationError(f"{label} must be finite, got {y!r}")
     return y
 
 
@@ -242,7 +259,8 @@ async def _newton(
         x -= step
         if not math.isfinite(x):
             # a diverging iterate is never a root, and evaluating f there would
-            # overflow a user's function into a ValueError instead of NaN
+            # overflow a user's function into a NonFiniteEvaluationError
+            # instead of NaN
             return float("nan")
         if i + 1 == maxiter:
             # f(x) would only be read by the check at the top of another

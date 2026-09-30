@@ -6,6 +6,7 @@ Provides:
   :func:`newton`, :func:`secant`, :func:`steffensen`.
 * **Multi-root finders** (async): :func:`roots_chebyshev`, :func:`roots_scan`.
 * **Batched execution** (async): :func:`async_vmap_pool`.
+* **Errors**: :class:`NonFiniteEvaluationError`.
 
 Scalar solvers return a ``float`` root, or ``NaN`` if they fail to converge.
 Multi-root finders return a sorted ``list`` of finite roots.
@@ -18,6 +19,7 @@ from .multi_root import (
     roots_scan,
 )
 from .root_finding import (
+    NonFiniteEvaluationError,
     bisection,
     brent,
     newton,
@@ -29,6 +31,7 @@ if TYPE_CHECKING:  # pragma: no cover - seen by type checkers only
     from .async_vmap import async_vmap_pool
 
 __all__ = [
+    "NonFiniteEvaluationError",
     "async_vmap_pool",
     "bisection",
     "brent",

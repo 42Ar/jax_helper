@@ -2,7 +2,13 @@ import asyncio
 import numpy as np
 import pytest
 
-from jax_helper import bisection, brent, roots_chebyshev, roots_scan
+from jax_helper import (
+    NonFiniteEvaluationError,
+    bisection,
+    brent,
+    roots_chebyshev,
+    roots_scan,
+)
 
 
 @pytest.mark.asyncio
@@ -303,7 +309,7 @@ async def test_scan_rejects_non_scalar_f():
 async def test_scan_rejects_nan_f():
     async def f_nan(x):
         return float("nan")
-    with pytest.raises(ValueError):
+    with pytest.raises(NonFiniteEvaluationError):
         await roots_scan(f_nan, 0.0, 4.0, n=10, ftol=1e-12)
 
 
