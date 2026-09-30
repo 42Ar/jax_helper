@@ -1,7 +1,8 @@
 # jax_helper
 
-Async scalar root-finding routines, plus a pooled JAX executor for running
-them (or anything else) across concurrent calls in one vectorised batch.
+Async scalar root-finding routines, an async CMA-ES optimizer, and a pooled
+JAX executor for running them (or anything else) across concurrent calls in
+one vectorised batch.
 
 ## Features
 
@@ -12,6 +13,8 @@ them (or anything else) across concurrent calls in one vectorised batch.
 - `steffensen(f, x0, ...)` — derivative-free Steffensen method.
 - `roots_scan(f, a, b, ...)` — all roots bracketed on a uniform grid.
 - `roots_chebyshev(f, a, b, ...)` — all roots via recursive Chebyshev subdivision.
+- `cma_es(f, x0, ...)` — async derivative-free population optimization,
+  bit-exact against `cma` 4.5.0 (see [CMA-ES](#cma-es)).
 - `async_vmap_pool(max_batch_size, ..., debug=False, padding='up', min_batch_size=1)` —
   async pooled executor over `vmap`; `debug=True` reports each execution and
   its batch size, `padding='down'` runs exact power-of-two prefixes instead of
@@ -238,6 +241,91 @@ task.
   running; the batch is already on its worker thread, so it finishes there,
   not on the loop.
 
+## CMA-ES
+
+`cma_es(f, x0, ...)` is an async, derivative-free, population-based optimizer
+for a black-box objective on a non-linear, non-convex domain. Each generation is
+one `asyncio.gather`, so the whole population is evaluated concurrently and
+composes with `async_vmap_pool` like any other objective.
+
+```python
+import numpy as np
+from jax_helper import cma_es
+
+async def f(x, w):
+    return float(np.sum(w * np.asarray(x) ** 2))
+
+res = await cma_es(f, [1.0, 1.0], args=(np.array([1.0, 2.0]),),
+                   sigma0=0.5, maxfev=20_000)
+
+print(res.x, res.f)          # best point found, and its objective
+print(res.status)            # why the run stopped
+print(res.mean, res.sigma)   # final distribution: centre and spread
+print(res.covariance)        # final covariance matrix
+print(res.n_evals, res.n_generations)
+```
+
+Extra parameters beyond `f` are passed through `args=()`, exactly as in the
+root finders.
+
+### Result
+
+`cma_es` returns a frozen `CmaEsResult`:
+
+| field | meaning |
+| --- | --- |
+| `x`, `f` | best candidate found, and its objective value |
+| `mean` | weighted recombination mean of the final population |
+| `covariance` | adapted covariance matrix |
+| `sigma` | adapted step size |
+| `n_evals`, `n_generations` | evaluation and generation counts |
+| `status` | why the run stopped: `f_target`, `sigma_tol`, `f_spread_tol`, `ill_conditioned`, `noaxisratio`, `maxfev`, or `maxiter` |
+
+### Budgets and defaults
+
+`maxfev` (objective evaluations) and `maxiter` (generations) are both
+optional. Supplying neither uses `maxfev = 500 * n`. Supplying `maxiter`
+alone runs that many generations; supplying `maxfev` stops before a generation
+that would overrun the budget. `maxfev` must be at least `popsize`, otherwise
+no generation can run and `ValueError` is raised.
+
+Other defaults follow the reference implementation: `popsize = 4 + floor(3 ln n)`,
+`sigma0 = 0.3`, and a diagonal initial covariance spanning four orders of
+magnitude across the coordinates.
+
+### Bit-exact against `cma`
+
+The algorithm is a direct port of [pycma](https://github.com/CMA-ES/pycma)
+at version **4.5.0** (see `LICENSE.pycma`). Given the same starting point,
+`sigma0`, population size, and the same normal samples, this
+implementation reproduces pycma's `mean`, `covariance`, and `sigma`
+**bit for bit** — the full strategy update is bitwise, not merely
+statistically equivalent. The test suite asserts this across a range of
+dimensions and for runs of many generations, with `cma==4.5.0` pinned as a
+development-only dependency.
+
+This means the port inherits some of pycma's deliberate quirks, for example
+lazily-decomposed covariance updates and rounding in the sampled population.
+
+Pass `rng=` to control the sampling. Any object with a NumPy-style
+`standard_normal(size)` method is accepted, which is how the tests replay a
+fixed sequence of samples on both sides.
+
+### CMA-ES limits
+
+- **Dimensions `n >= 2`.** pycma does not support 1-D CMA-ES, and the port
+  follows it in that.
+- **A finite, fixed domain.** There is no handling of bounds, constraints,
+  integer or categorical variables, parameter transformations, noise
+  estimation, or injected solutions.
+- **No restarts.** A single run; use restarts yourself if you want IPOP or
+  BIPOP behaviour.
+- **Sequential generations.** Only the population is parallel. The strategy
+  update runs on the calling task between generations.
+- **Deterministic arithmetic.** Exactness is with respect to the NumPy build
+  in use; different BLAS or LAPACK builds can differ in the last bit, and
+  pycma itself is not bit-reproducible across those.
+
 ## Install
 
 ```bash
@@ -284,3 +372,5 @@ asyncio.run(main())
 ```bash
 pytest
 ```
+
+Run `python -m pyright` for the type check.

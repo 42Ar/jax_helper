@@ -5,10 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jax-helper"
 version = "0.1.0"
-description = "Async root-finding routines with pooled vectorised execution"
+description = "Async root-finding and CMA-ES routines with pooled vectorised execution"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
+# LICENSE.pycma carries the BSD-3-Clause notice that clause 2 of that licence
+# requires us to ship with the distribution.
+license-files = ["LICENSE", "LICENSE.pycma"]
 dependencies = [
     "jax",
     "numpy",
@@ -19,6 +22,10 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pyright",
+    # Reference implementation for the bit-exactness tests of
+    # jax_helper.optimization.cmaes.  Not a runtime dependency; the exact
+    # version matters because the port tracks its arithmetic.
+    "cma==4.5.0",
 ]
 
 [tool.setuptools.packages.find]

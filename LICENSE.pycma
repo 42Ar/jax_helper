@@ -1,0 +1,53 @@
+pycma attribution
+=================
+
+`jax_helper.optimization.cmaes` is a derivative work of pycma (the `cma`
+package), a pure-Python implementation of the CMA-ES algorithm.  It reproduces
+pycma's default isotropic CMA-ES code path, including its arithmetic operation
+order, so that for equal normal samples it produces bitwise identical state.
+
+  pycma
+  https://github.com/CMA-ES/pycma
+  Copyright (c) 2014 Inria
+  Author: Nikolaus Hansen, 2008-
+  Author: Petr Baudis, 2014
+  Author: Youhei Akimoto, 2016-
+
+  Upstream version tracked: cma==4.5.0
+
+pycma is distributed under the BSD 3-Clause License, reproduced verbatim below.
+Note that the `cma` package is an independent reference implementation: it is
+not a dependency of `jax-helper` and is never imported by the library.  It is a
+development dependency only, used to verify that this port matches bitwise.
+
+
+The BSD 3-Clause License
+Copyright (c) 2014 Inria
+Author: Nikolaus Hansen, 2008-
+Author: Petr Baudis, 2014
+Author: Youhei Akimoto, 2016-
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright and
+   authors notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   and authors notice, this list of conditions and the following
+   disclaimer in the documentation and/or other materials provided with
+   the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors nor the authors names may be used to endorse or promote
+   products derived from this software without specific prior written
+   permission.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
