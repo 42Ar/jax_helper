@@ -1,8 +1,45 @@
 # jax_helper
 
-Async scalar root-finding routines, an async CMA-ES optimizer, and a pooled
-JAX executor for running them (or anything else) across concurrent calls in
-one vectorised batch.
+Async scalar root-finding routines, async CMA-ES and Nelder-Mead optimizers, and
+a pooled JAX executor for running them (or anything else) across concurrent
+calls in one vectorised batch.
+
+> ## ⚠️ This package is vibe coded
+>
+> **Read this before you use anything here.**
+>
+> Every algorithm in this package was written by an LLM from the published
+> reference implementations. It was not designed, derived, or reviewed by
+> anyone with the relevant mathematical background. "Vibe coded" is the
+> accurate description: it was written by pattern-matching against references
+> and documentation, and the result was iterated on until the tests passed.
+>
+> What that means in practice:
+>
+> - **No human expert has checked the math.** Not one line of the derivations,
+>   the convergence arguments, or the edge cases has been validated by someone
+>   qualified to do so. Some of it is probably right. Some of it is probably
+>   subtly wrong in ways that are invisible to the tests.
+> - **No code review, no security audit, no formal verification.** None. The
+>   type checker and the test suite are the *only* checks that exist, and both
+>   are things I asked the same LLM to satisfy, so they mostly prove internal
+>   consistency rather than correctness.
+> - **Passing tests do not mean correct.** The suite is decent — it includes
+>   bitwise differential tests against `cma==4.5.0` and SciPy 1.16 — but a
+>   reference is only ever consulted on the cases someone thought to test. The
+>   claims that hold are the ones I checked; the ones I did not think to check
+>   are unchecked, not verified.
+> - **The failure mode is a wrong number, not a crash.** A bad root or a bad
+>   minimiser typically returns a plausible-looking finite result rather than
+>   raising. Silent wrong answers are exactly what you cannot afford in a
+>   numerical library, and nothing here rules them out.
+> - **The documentation is written by the same LLM** and inherits the same
+>   blind spots. Treat the claims in it as claims, not as evidence.
+>
+> **Use it for exploration, prototyping, and as something to read, review, and
+> argue with. Verify anything you depend on against a trusted implementation
+> before you trust it.** If you need numerical results you can stake a decision
+> on, use SciPy, or use something that a domain expert has reviewed.
 
 ## Features
 
@@ -15,6 +52,8 @@ one vectorised batch.
 - `roots_chebyshev(f, a, b, ...)` — all roots via recursive Chebyshev subdivision.
 - `cma_es(f, x0, ...)` — async derivative-free population optimization,
   bit-exact against `cma` 4.5.0 (see [CMA-ES](#cma-es)).
+- `nelder_mead(f, x0, ...)` — async simplex search, bitwise against SciPy for
+  its default coefficients (see [Nelder-Mead](#nelder-mead)).
 - `async_vmap_pool(max_batch_size, ..., debug=False, padding='up', min_batch_size=1)` —
   async pooled executor over `vmap`; `debug=True` reports each execution and
   its batch size, `padding='down'` runs exact power-of-two prefixes instead of
@@ -38,6 +77,11 @@ required** — passing neither raises `ValueError`:
 
 Neither has a default, so convergence is always explicit. `ftol` applies to
 every algorithm, including the bracketed `bisection` and `brent`.
+
+The optimizers are the exception: they follow their reference implementations
+instead, where the criteria mean something else and default to `1e-4`. See
+[CMA-ES budgets](#budgets-and-defaults) and
+[Nelder-Mead tolerances](#tolerances-1).
 
 `ftol` is absolute and means one thing everywhere: a function value is a root
 if it is exactly `0.0` or within `ftol` of it. That holds at a bracket's entry
@@ -326,6 +370,130 @@ fixed sequence of samples on both sides.
   in use; different BLAS or LAPACK builds can differ in the last bit, and
   pycma itself is not bit-reproducible across those.
 
+## Nelder-Mead
+
+`nelder_mead(f, x0, ...)` is an async, derivative-free local optimizer that
+maintains a simplex of `n + 1` vertices around the incumbent best point.
+
+```python
+import numpy as np
+from jax_helper import nelder_mead
+
+async def f(x):
+    return float(np.sum((np.asarray(x) - 1.0) ** 2))
+
+res = await nelder_mead(f, [0.0, 0.0])
+print(res.x, res.f, res.status)  # [1. 1.] 0.0 converged
+```
+
+Each iteration reflects the worst vertex through the centroid of the rest and
+then either accepts the result, expands past it when it is the new best,
+contracts towards the centroid, or shrinks the whole simplex towards the best
+vertex. The four coefficients are named parameters, matching SciPy:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `reflect` | `1.0` | How far past the centroid the worst vertex is mirrored. |
+| `expand` | `2.0` | How far past the centroid to probe when the reflection is the new best. |
+| `contract` | `0.5` | How far from the centroid towards the worst vertex the outside contraction sits. |
+| `shrink` | `0.5` | How far the simplex contracts towards its best vertex when it contracts at all. |
+
+`reflect`, `contract`, and `shrink` must be strictly positive. `expand` may be
+`0.0`, which **disables the expansion step entirely** — the evaluation is
+skipped, not merely collapsed onto the reflection. That turns the method into a
+reflection-only simplex search that is often a little cheaper per iteration
+and occasionally converges faster, but it is not SciPy's default and is not
+bitwise comparable to it.
+
+`initial_simplex=` replaces the automatic initial simplex, whose vertices sit
+`5 %` away from `x0` along each coordinate in turn. A supplied simplex also
+supplies the starting point: if it disagrees with `x0`, the simplex wins and
+`x0` is ignored. Points are evaluated in the order given, which matters because
+the first `n + 1` evaluations populate the result.
+
+### Result
+
+`nelder_mead` returns a frozen `NelderMeadResult`:
+
+| Field | Meaning |
+| --- | --- |
+| `x` | Best point found, the best vertex of the final simplex. |
+| `f` | Objective value at `x`. |
+| `simplex` | Final simplex, shape `(n + 1, n)`, sorted best to worst. |
+| `f_simplex` | Objective value at each vertex of `simplex`. |
+| `n_evals` | Objective evaluations, including the initial simplex. |
+| `n_iterations` | Completed iterations, at least `1` even if no iteration ran. |
+| `status` | `'converged'`, `'maxfev'`, or `'maxiter'`. |
+
+Unlike the root finders, there is no `NaN` on failure: the returned `x` is
+simply the best point seen, and `status` says why the run stopped.
+
+### Tolerances
+
+`nelder_mead` deliberately does **not** use the
+[package-wide tolerance convention](#tolerances), because SciPy's criteria are
+not expressible in those terms:
+
+- `ftol` — the spread `max(f_simplex) - min(f_simplex) <= ftol`. It measures
+  how flat the simplex has become, **not** how close the objective is to zero.
+- `xtol` — the largest coordinate-wise extent of the simplex,
+  `max_j(max_i simplex[i, j] - min_i simplex[i, j]) <= xtol`. It measures how
+  small the simplex has become.
+
+Both default to `1e-4`, both are optional, and the run stops only when **both**
+hold — there is no "at least one is required" check, and no machine-precision
+floor on either. That also means a function whose values are large in
+magnitude can satisfy `ftol` while still far from a minimum, which is
+SciPy's behaviour and the reason `x` should be checked, not just `f`.
+
+### Budgets and defaults
+
+`maxfev` and `maxiter` are both optional and both default to `200 * n`, so
+supplying neither gives SciPy's own default. `maxfev` is checked before every
+evaluation, so a budget can be exceeded by at most the simplex construction:
+a run that cannot afford even one iteration still reports the initial simplex
+and `status='maxfev'`.
+
+As with SciPy, a budget can be exhausted part-way through an iteration, which
+leaves the simplex mid-step — `simplex` and `f_simplex` are then a valid pair
+of vertices and values, but not necessarily a consistent simplex.
+
+### Bitwise against SciPy
+
+Given the default coefficients and no `initial_simplex`, this implementation
+reproduces `scipy.optimize.minimize(method='Nelder-Mead')` from SciPy 1.16
+**bit for bit**: the final point, its objective value, and the evaluation count
+all match exactly, at convergence and at tight budgets mid-run. The test suite
+asserts this across dimensions and objectives whenever SciPy is importable.
+
+Two properties make that hold, and both are worth knowing before editing the
+loop:
+
+- The arithmetic is transcribed from SciPy literally, including
+  `np.add.reduce` for the centroid and the off-by-one in `n_iterations`,
+  which starts at `1` and counts completed iterations. "Equivalent" algebraic
+  rewrites change the last bit and break agreement.
+- The initial simplex is sorted twice, once before the loop and again at the
+  top of it, because SciPy does. Dropping either sort diverges immediately.
+
+The non-default coefficients are genuine behaviour changes, not
+reimplementations of SciPy's path, so bitwise agreement is only claimed for
+the defaults. SciPy is not a dependency: it is used only as a test reference,
+and those tests skip when it is absent.
+
+### Nelder-Mead limits
+
+- **No bounds or constraints.** Vertices are never clipped; run an unconstrained
+  search and reject the result yourself, or transform the domain.
+- **A finite, fixed domain.** There is no handling of noise, integer or
+  categorical variables, or parameter transformations.
+- **No restarts.** A single run. Nelder-Mead stalls on flat and ridged
+  landscapes, and CMA-ES or a restart wrapper will usually do better on those.
+- **Sequential evaluations.** Every vertex is awaited in turn. There is no
+  population to batch.
+- **Deterministic arithmetic.** Exactness is with respect to the NumPy build
+  in use; different BLAS or LAPACK builds can differ in the last bit.
+
 ## Install
 
 ```bash
@@ -364,6 +532,15 @@ async def main():
     roots = await roots_scan(h, -1.0, 4.0, xtol=1e-12)
     print(roots)                          # [1.0, 2.0, 3.0]
 
+    # Optimize, with the criterion meaning the reference defines:
+    from jax_helper import nelder_mead
+
+    async def sphere(x):
+        return sum(v * v for v in x)
+
+    res = await nelder_mead(sphere, [3.0, 4.0])
+    print(res.x, res.status)              # [0. 0.] converged
+
 asyncio.run(main())
 ```
 
@@ -374,3 +551,7 @@ pytest
 ```
 
 Run `python -m pyright` for the type check.
+
+The `cma` and `scipy` packages are development-only references. The CMA-ES
+tests are skipped without `cma`; the Nelder-Mead suite runs without `scipy` and
+skips only the 13 differential tests that compare against it.

@@ -5,14 +5,17 @@ Provides:
 * **Scalar solvers** (async): :func:`bisection`, :func:`brent`,
   :func:`newton`, :func:`secant`, :func:`steffensen`.
 * **Multi-root finders** (async): :func:`roots_chebyshev`, :func:`roots_scan`.
-* **Optimizers** (async): :func:`cma_es`, returning a :class:`CmaEsResult`.
+* **Optimizers** (async): :func:`cma_es` returning a :class:`CmaEsResult`, and
+  :func:`nelder_mead` returning a :class:`NelderMeadResult`.
 * **Batched execution** (async): :func:`async_vmap_pool`.
 * **Errors**: :class:`NonFiniteEvaluationError`.
 
 Scalar solvers return a ``float`` root, or ``NaN`` if they fail to converge.
 Multi-root finders return a sorted ``list`` of finite roots.
 :func:`cma_es` is a bit-exact port of the default isotropic CMA-ES of
-``cma==4.5.0`` (pycma, BSD-3-Clause; see ``LICENSE.pycma``).
+``cma==4.5.0`` (pycma, BSD-3-Clause; see ``LICENSE.pycma``), and
+:func:`nelder_mead` reproduces SciPy 1.16's ``'Nelder-Mead'`` method bitwise
+for the default coefficients.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -21,7 +24,7 @@ from .multi_root import (
     roots_chebyshev,
     roots_scan,
 )
-from .optimization import CmaEsResult, cma_es
+from .optimization import CmaEsResult, NelderMeadResult, Point, cma_es, nelder_mead
 from .root_finding import (
     NonFiniteEvaluationError,
     bisection,
@@ -36,11 +39,14 @@ if TYPE_CHECKING:  # pragma: no cover - seen by type checkers only
 
 __all__ = [
     "CmaEsResult",
+    "NelderMeadResult",
     "NonFiniteEvaluationError",
+    "Point",
     "async_vmap_pool",
     "bisection",
     "brent",
     "cma_es",
+    "nelder_mead",
     "newton",
     "roots_chebyshev",
     "roots_scan",

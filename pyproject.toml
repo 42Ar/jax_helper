@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jax-helper"
 version = "0.1.0"
-description = "Async root-finding and CMA-ES routines with pooled vectorised execution"
+description = "Async root-finding, CMA-ES and Nelder-Mead routines with pooled vectorised execution"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
